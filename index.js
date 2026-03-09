@@ -207,6 +207,10 @@ app.post("/convert", upload.single("file"), async (req, res) => {
   });
 });
 
+app.get("/health", (req, res) => {
+  res.json({ ok: true, service: "converto-server" });
+});
+
 const PORT = process.env.PORT || 10000;
 
 app.listen(PORT, () => {
