@@ -18,78 +18,40 @@ app.use(cors());
 app.use(express.json());
 
 const TARGETS = [
-  "MP3",
-  "WAV",
-  "M4A",
-  "AAC",
-  "OGG",
-  "OPUS",
-  "FLAC",
-  "MP4",
-  "WEBM",
-  "MOV",
-  "GIF",
+  "MP3","WAV","M4A","AAC","OGG","OPUS","FLAC",
+  "MP4","WEBM","MOV","GIF"
 ];
 
-function detectInputType(filename = "") {
+function detectInputType(filename="") {
   const n = filename.toLowerCase();
 
-  if (
-    n.endsWith(".mp3") ||
-    n.endsWith(".wav") ||
-    n.endsWith(".m4a") ||
-    n.endsWith(".aac") ||
-    n.endsWith(".ogg") ||
-    n.endsWith(".opus") ||
-    n.endsWith(".flac")
-  ) {
+  if ([".mp3",".wav",".m4a",".aac",".ogg",".opus",".flac"].some(e=>n.endsWith(e)))
     return "audio";
-  }
 
-  if (n.endsWith(".gif")) {
+  if (n.endsWith(".gif"))
     return "gif";
-  }
 
-  if (
-    n.endsWith(".mp4") ||
-    n.endsWith(".mov") ||
-    n.endsWith(".mkv") ||
-    n.endsWith(".avi") ||
-    n.endsWith(".wmv") ||
-    n.endsWith(".flv") ||
-    n.endsWith(".mpg") ||
-    n.endsWith(".mpeg") ||
-    n.endsWith(".m4v") ||
-    n.endsWith(".3gp") ||
-    n.endsWith(".ts") ||
-    n.endsWith(".mts") ||
-    n.endsWith(".m2ts") ||
-    n.endsWith(".webm")
-  ) {
+  if ([
+    ".mp4",".mov",".mkv",".avi",".wmv",".flv",".mpg",".mpeg",
+    ".m4v",".3gp",".ts",".mts",".m2ts",".webm"
+  ].some(e=>n.endsWith(e)))
     return "video";
-  }
 
   return "unknown";
 }
 
 function getOutputExt(target) {
   return {
-    MP3: "mp3",
-    WAV: "wav",
-    M4A: "m4a",
-    AAC: "aac",
-    OGG: "ogg",
-    OPUS: "opus",
-    FLAC: "flac",
-    MP4: "mp4",
-    WEBM: "webm",
-    MOV: "mov",
-    GIF: "gif",
+    MP3:"mp3", WAV:"wav", M4A:"m4a", AAC:"aac",
+    OGG:"ogg", OPUS:"opus", FLAC:"flac",
+    MP4:"mp4", WEBM:"webm", MOV:"mov", GIF:"gif"
   }[target];
 }
 
-function buildFfmpegCommand({ inputPath, outputPath, target, inputType }) {
-  switch (target) {
+function buildFfmpegCommand({inputPath,outputPath,target,inputType}) {
+
+  switch(target){
+
     case "MP3":
       return `ffmpeg -y -i "${inputPath}" -vn -c:a libmp3lame -q:a 3 "${outputPath}"`;
 
@@ -110,109 +72,109 @@ function buildFfmpegCommand({ inputPath, outputPath, target, inputType }) {
       return `ffmpeg -y -i "${inputPath}" -vn -c:a flac "${outputPath}"`;
 
     case "MP4":
-      if (inputType === "audio") {
+      if(inputType==="audio")
         return `ffmpeg -y -i "${inputPath}" -vn -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
-      }
+
       return `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 128k -movflags +faststart "${outputPath}"`;
 
     case "WEBM":
-      if (inputType === "audio") {
+      if(inputType==="audio")
         return `ffmpeg -y -i "${inputPath}" -vn -c:a libopus -b:a 128k "${outputPath}"`;
-      }
+
       return `ffmpeg -y -i "${inputPath}" -c:v libvpx -crf 30 -b:v 0 -c:a libopus -b:a 128k "${outputPath}"`;
 
     case "MOV":
-      if (inputType === "audio") {
+      if(inputType==="audio")
         return `ffmpeg -y -i "${inputPath}" -vn -c:a aac -b:a 128k "${outputPath}"`;
-      }
+
       return `ffmpeg -y -i "${inputPath}" -c:v libx264 -preset veryfast -crf 28 -c:a aac -b:a 128k "${outputPath}"`;
 
     case "GIF":
-      if (inputType === "audio") {
-        throw new Error("GIF needs a video input.");
-      }
+      if(inputType==="audio")
+        throw new Error("GIF needs video input");
+
       return `ffmpeg -y -i "${inputPath}" -vf "fps=10,scale=480:-1:flags=lanczos" -loop 0 "${outputPath}"`;
 
     default:
-      throw new Error("Unsupported target format.");
+      throw new Error("Unsupported target format");
   }
 }
 
-function safeDelete(filePath) {
-  try {
-    if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-  } catch {}
+function safeDelete(p){
+  try{
+    if(fs.existsSync(p)) fs.unlinkSync(p);
+  }catch{}
 }
 
-app.get("/", (req, res) => {
-  res.send("Converto server is running");
+app.get("/",(req,res)=>{
+  res.send("Converto server running");
 });
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "converto-server" });
+app.get("/health",(req,res)=>{
+  res.json({ok:true});
 });
 
-app.post("/convert", upload.single("file"), async (req, res) => {
-  const inputFile = req.file;
-  const target = String(req.body?.target || "").toUpperCase();
+app.post("/convert", upload.single("file"), (req,res)=>{
 
-  if (!inputFile) {
-    return res.status(400).json({ error: "No file uploaded." });
-  }
+  const inputFile=req.file;
+  const target=String(req.body?.target||"").toUpperCase();
 
-  if (!TARGETS.includes(target)) {
+  if(!inputFile)
+    return res.status(400).json({error:"No file uploaded"});
+
+  if(!TARGETS.includes(target)){
     safeDelete(inputFile.path);
-    return res.status(400).json({ error: "Unsupported target format." });
+    return res.status(400).json({error:"Unsupported target"});
   }
 
-  const inputType = detectInputType(inputFile.originalname);
-  if (inputType === "unknown") {
+  const inputType=detectInputType(inputFile.originalname);
+
+  if(inputType==="unknown"){
     safeDelete(inputFile.path);
-    return res.status(400).json({ error: "Unsupported input format." });
+    return res.status(400).json({error:"Unsupported input"});
   }
 
-  const outputExt = getOutputExt(target);
-  const outputPath = `${inputFile.path}.${outputExt}`;
-  const downloadName = `${path.parse(inputFile.originalname).name}_converto.${outputExt}`;
+  const outputExt=getOutputExt(target);
+  const outputPath=`${inputFile.path}.${outputExt}`;
+
+  const downloadName=`${path.parse(inputFile.originalname).name}_converto.${outputExt}`;
 
   let command;
-  try {
-    command = buildFfmpegCommand({
-      inputPath: inputFile.path,
+
+  try{
+    command=buildFfmpegCommand({
+      inputPath:inputFile.path,
       outputPath,
       target,
-      inputType,
+      inputType
     });
-  } catch (err) {
+  }catch(err){
     safeDelete(inputFile.path);
-    return res.status(400).json({ error: err.message || "Invalid conversion request." });
+    return res.status(400).json({error:err.message});
   }
 
-  exec(command, (error, stdout, stderr) => {
-    if (error) {
-      console.error("FFmpeg error:", stderr || error.message);
+  exec(command,(error,stdout,stderr)=>{
+
+    if(error){
+      console.error(stderr);
       safeDelete(inputFile.path);
       safeDelete(outputPath);
-      return res.status(500).json({ error: "Conversion failed on server." });
+      return res.status(500).json({error:"Conversion failed"});
     }
 
-    res.download(outputPath, downloadName, (downloadErr) => {
+    res.download(outputPath,downloadName,(err)=>{
       safeDelete(inputFile.path);
       safeDelete(outputPath);
 
-      if (downloadErr) {
-        console.error("Download error:", downloadErr.message);
-      }
+      if(err) console.error(err);
     });
-  });
-});
 
-app.get("/health", (req, res) => {
-  res.json({ ok: true, service: "converto-server" });
+  });
+
 });
 
 const PORT = process.env.PORT || 10000;
 
-app.listen(PORT, () => {
-  console.log(`Converto server listening on port ${PORT}`);
+app.listen(PORT,()=>{
+  console.log("Converto server running on port",PORT);
 });
