@@ -195,10 +195,15 @@ app.post("/convert", upload.single("file"), (req, res) => {
 
   exec(command, (error, stdout, stderr) => {
     if (error) {
-      console.error("FFmpeg error:", stderr || error.message);
+      const detailedError = stderr || error.message || "Unknown FFmpeg error";
+      console.error("FFmpeg error:", detailedError);
+
       safeDelete(inputFile.path);
       safeDelete(outputPath);
-      return res.status(500).json({ error: "Conversion failed on server." });
+
+      return res.status(500).json({
+        error: detailedError.slice(0, 1200),
+      });
     }
 
     res.download(outputPath, downloadName, (downloadErr) => {
@@ -207,8 +212,18 @@ app.post("/convert", upload.single("file"), (req, res) => {
 
       if (downloadErr) {
         console.error("Download error:", downloadErr.message);
+
+        if (!res.headersSent) {
+          return res.status(500).json({ error: downloadErr.message });
+        }
       }
     });
+  });
+
+  req.on("aborted", () => {
+    console.warn("Client aborted request during /convert");
+    safeDelete(inputFile?.path);
+    safeDelete(outputPath);
   });
 });
 
