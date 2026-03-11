@@ -14,7 +14,12 @@ if (!fs.existsSync(uploadDir)) {
   fs.mkdirSync(uploadDir, { recursive: true });
 }
 
-const upload = multer({ dest: uploadDir });
+const upload = multer({
+  dest: uploadDir,
+  limits: {
+    fileSize: 50 * 1024 * 1024,
+  },
+});
 
 app.use(cors());
 app.use(express.json());
@@ -58,6 +63,13 @@ const IMAGE_TARGETS = [
 ];
 
 const TARGETS = [...AUDIO_TARGETS, ...VIDEO_TARGETS, ...IMAGE_TARGETS];
+
+const ffprobePath = (() => {
+  const dir = path.dirname(ffmpegPath);
+  const bin = process.platform === "win32" ? "ffprobe.exe" : "ffprobe";
+  const candidate = path.join(dir, bin);
+  return fs.existsSync(candidate) ? candidate : "ffprobe";
+})();
 
 function safeDelete(filePath) {
   try {
@@ -184,38 +196,207 @@ function isConversionAllowed(inputType, target) {
   return false;
 }
 
+function runProcess(bin, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, { windowsHide: true });
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (data) => {
+      stdout += data.toString();
+    });
+
+    child.stderr.on("data", (data) => {
+      stderr += data.toString();
+    });
+
+    child.on("error", (error) => {
+      reject(error);
+    });
+
+    child.on("close", (code) => {
+      if (code !== 0) {
+        const err = new Error(stderr || stdout || `${bin} exited with code ${code}`);
+        err.code = code;
+        reject(err);
+        return;
+      }
+
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
+async function probeMedia(inputPath) {
+  const args = [
+    "-v",
+    "error",
+    "-print_format",
+    "json",
+    "-show_streams",
+    inputPath,
+  ];
+
+  try {
+    const { stdout } = await runProcess(ffprobePath, args);
+    const data = JSON.parse(stdout || "{}");
+    const streams = Array.isArray(data.streams) ? data.streams : [];
+
+    return {
+      hasAudio: streams.some((s) => s.codec_type === "audio"),
+      hasVideo: streams.some((s) => s.codec_type === "video"),
+      streams,
+    };
+  } catch {
+    return {
+      hasAudio: false,
+      hasVideo: false,
+      streams: [],
+    };
+  }
+}
+
 function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
   switch (target) {
     /** AUDIO OUTPUTS */
     case "MP3":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "libmp3lame", "-q:a", "3", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "libmp3lame",
+        "-q:a",
+        "3",
+        outputPath,
+      ];
 
     case "WAV":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "pcm_s16le", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "pcm_s16le",
+        outputPath,
+      ];
 
     case "M4A":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "aac", "-b:a", "128k", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        outputPath,
+      ];
 
     case "AAC":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "aac", "-b:a", "128k", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        outputPath,
+      ];
 
     case "OGG":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "libvorbis", "-q:a", "5", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "libvorbis",
+        "-q:a",
+        "5",
+        outputPath,
+      ];
 
     case "OPUS":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "libopus", "-b:a", "128k", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "libopus",
+        "-b:a",
+        "128k",
+        outputPath,
+      ];
 
     case "FLAC":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "flac", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "flac",
+        outputPath,
+      ];
 
     case "AIFF":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "pcm_s16be", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "pcm_s16be",
+        outputPath,
+      ];
 
     case "WMA":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "wmav2", "-b:a", "128k", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "wmav2",
+        "-b:a",
+        "128k",
+        outputPath,
+      ];
 
     case "AMR":
-      return ["-y", "-i", inputPath, "-vn", "-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "12.2k", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:a:0",
+        "-c:a",
+        "libopencore_amrnb",
+        "-ar",
+        "8000",
+        "-ac",
+        "1",
+        "-b:a",
+        "12.2k",
+        outputPath,
+      ];
 
     /** VIDEO OUTPUTS */
     case "MP4":
@@ -223,6 +404,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "libx264",
         "-preset",
@@ -243,6 +428,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "libvpx-vp9",
         "-crf",
@@ -261,6 +450,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "libx264",
         "-preset",
@@ -279,6 +472,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "libx264",
         "-preset",
@@ -297,6 +494,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "mpeg4",
         "-q:v",
@@ -313,6 +514,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "wmv2",
         "-b:v",
@@ -329,6 +534,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "flv",
         "-b:v",
@@ -345,6 +554,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "libx264",
         "-preset",
@@ -364,6 +577,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "mpeg2video",
         "-q:v",
@@ -380,6 +597,10 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0?",
+        "-map",
+        "0:a:0?",
         "-c:v",
         "h263",
         "-c:a",
@@ -395,13 +616,12 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
 
     /** IMAGE OUTPUTS */
     case "GIF":
-      if (inputType !== "video") {
-        throw new Error("GIF output currently needs video input.");
-      }
       return [
         "-y",
         "-i",
         inputPath,
+        "-map",
+        "0:v:0",
         "-vf",
         "fps=10,scale=480:-1:flags=lanczos",
         "-loop",
@@ -410,25 +630,71 @@ function buildFfmpegArgs({ inputPath, outputPath, target, inputType }) {
       ];
 
     case "PNG":
-      return ["-y", "-i", inputPath, "-frames:v", "1", outputPath];
+      return ["-y", "-i", inputPath, "-map", "0:v:0", "-frames:v", "1", outputPath];
 
     case "JPG":
-      return ["-y", "-i", inputPath, "-frames:v", "1", "-q:v", "2", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-q:v",
+        "2",
+        outputPath,
+      ];
 
     case "WEBP":
-      return ["-y", "-i", inputPath, "-frames:v", "1", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libwebp",
+        outputPath,
+      ];
 
     case "BMP":
-      return ["-y", "-i", inputPath, "-frames:v", "1", outputPath];
+      return ["-y", "-i", inputPath, "-map", "0:v:0", "-frames:v", "1", outputPath];
 
     case "TIFF":
-      return ["-y", "-i", inputPath, "-frames:v", "1", outputPath];
+      return ["-y", "-i", inputPath, "-map", "0:v:0", "-frames:v", "1", outputPath];
 
     case "ICO":
-      return ["-y", "-i", inputPath, "-vf", "scale=256:256:force_original_aspect_ratio=decrease", "-frames:v", "1", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:v:0",
+        "-vf",
+        "scale=256:256:force_original_aspect_ratio=decrease",
+        "-frames:v",
+        "1",
+        outputPath,
+      ];
 
     case "AVIF":
-      return ["-y", "-i", inputPath, "-frames:v", "1", outputPath];
+      return [
+        "-y",
+        "-i",
+        inputPath,
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        "1",
+        "-c:v",
+        "libaom-av1",
+        "-still-picture",
+        "1",
+        outputPath,
+      ];
 
     default:
       throw new Error("Unsupported target format.");
@@ -444,11 +710,12 @@ app.get("/health", (req, res) => {
     ok: true,
     service: "converto-server",
     ffmpegPath,
+    ffprobePath,
     targets: TARGETS,
   });
 });
 
-app.post("/convert", upload.single("file"), (req, res) => {
+app.post("/convert", upload.single("file"), async (req, res) => {
   console.log("POST /convert received", {
     file: req.file?.originalname,
     target: req.body?.target,
@@ -480,6 +747,23 @@ app.post("/convert", upload.single("file"), (req, res) => {
     });
   }
 
+  const mediaInfo = await probeMedia(inputFile.path);
+  const targetCategory = getTargetCategory(target);
+
+  if (targetCategory === "audio" && !mediaInfo.hasAudio) {
+    safeDelete(inputFile.path);
+    return res.status(400).json({
+      error: "This file does not contain an audio stream.",
+    });
+  }
+
+  if ((targetCategory === "video" || targetCategory === "image") && !mediaInfo.hasVideo) {
+    safeDelete(inputFile.path);
+    return res.status(400).json({
+      error: "This file does not contain a video/image stream.",
+    });
+  }
+
   const outputExt = getOutputExt(target);
   const outputPath = `${inputFile.path}.${outputExt}`;
   const downloadName = `${path.parse(inputFile.originalname).name}_converto.${outputExt}`;
@@ -502,9 +786,18 @@ app.post("/convert", upload.single("file"), (req, res) => {
 
   console.log("Running ffmpeg:", ffmpegPath, ffmpegArgs.join(" "));
 
-  const ff = spawn(ffmpegPath, ffmpegArgs, {
-    windowsHide: true,
-  });
+  let ff;
+  try {
+    ff = spawn(ffmpegPath, ffmpegArgs, {
+      windowsHide: true,
+    });
+  } catch (error) {
+    safeDelete(inputFile.path);
+    safeDelete(outputPath);
+    return res.status(500).json({
+      error: error.message || "Failed to start FFmpeg.",
+    });
+  }
 
   let stderr = "";
   let stdout = "";
@@ -521,9 +814,12 @@ app.post("/convert", upload.single("file"), (req, res) => {
     console.error("FFmpeg spawn error:", error);
     safeDelete(inputFile.path);
     safeDelete(outputPath);
-    return res.status(500).json({
-      error: error.message || "Failed to start FFmpeg.",
-    });
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: error.message || "Failed to start FFmpeg.",
+      });
+    }
   });
 
   ff.on("close", (code) => {
@@ -534,9 +830,12 @@ app.post("/convert", upload.single("file"), (req, res) => {
       safeDelete(inputFile.path);
       safeDelete(outputPath);
 
-      return res.status(500).json({
-        error: detailedError.slice(0, 1200),
-      });
+      if (!res.headersSent) {
+        return res.status(500).json({
+          error: detailedError.slice(0, 1200),
+        });
+      }
+      return;
     }
 
     res.download(outputPath, downloadName, (downloadErr) => {
@@ -561,6 +860,15 @@ app.post("/convert", upload.single("file"), (req, res) => {
     safeDelete(inputFile?.path);
     safeDelete(outputPath);
   });
+});
+
+app.use((err, req, res, next) => {
+  if (err && err.code === "LIMIT_FILE_SIZE") {
+    return res.status(400).json({ error: "File is too large. Max 50MB." });
+  }
+
+  console.error("Unhandled server error:", err);
+  return res.status(500).json({ error: "Internal server error." });
 });
 
 const PORT = process.env.PORT || 10000;
