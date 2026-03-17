@@ -96,7 +96,12 @@ const MIME_MAP = {
 };
 
 function safeUnlink(filePath) {
+  if (!filePath) return;
   fs.unlink(filePath, () => {});
+}
+
+function cleanupFiles(...paths) {
+  for (const p of paths) safeUnlink(p);
 }
 
 function normalizeTarget(value) {
@@ -119,29 +124,95 @@ function isSupportedTarget(target) {
   );
 }
 
+function buildOutputName(originalName, target) {
+  const base = path.parse(originalName || "output").name || "output";
+  return `${base}_converto.${target}`;
+}
+
 function buildFfmpegArgs(inputPath, target, outputPath) {
   if (AUDIO_FORMATS.has(target)) {
     switch (target) {
       case "mp3":
-        return ["-i", inputPath, "-vn", "-codec:a", "libmp3lame", "-q:a", "2", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-codec:a", "libmp3lame",
+          "-q:a", "3",
+          outputPath,
+        ];
+
       case "wav":
-        return ["-i", inputPath, "-vn", "-c:a", "pcm_s16le", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "pcm_s16le",
+          outputPath,
+        ];
+
       case "m4a":
-        return ["-i", inputPath, "-vn", "-c:a", "aac", "-b:a", "192k", outputPath];
       case "aac":
-        return ["-i", inputPath, "-vn", "-c:a", "aac", "-b:a", "192k", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "aac",
+          "-b:a", "160k",
+          outputPath,
+        ];
+
       case "ogg":
-        return ["-i", inputPath, "-vn", "-c:a", "libvorbis", "-q:a", "5", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "libvorbis",
+          "-q:a", "4",
+          outputPath,
+        ];
+
       case "opus":
-        return ["-i", inputPath, "-vn", "-c:a", "libopus", "-b:a", "160k", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "libopus",
+          "-b:a", "128k",
+          outputPath,
+        ];
+
       case "flac":
-        return ["-i", inputPath, "-vn", "-c:a", "flac", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "flac",
+          outputPath,
+        ];
+
       case "aiff":
-        return ["-i", inputPath, "-vn", "-c:a", "pcm_s16be", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "pcm_s16be",
+          outputPath,
+        ];
+
       case "wma":
-        return ["-i", inputPath, "-vn", "-c:a", "wmav2", "-b:a", "192k", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "wmav2",
+          "-b:a", "160k",
+          outputPath,
+        ];
+
       case "amr":
-        return ["-i", inputPath, "-vn", "-c:a", "libopencore_amrnb", "-ar", "8000", "-ac", "1", "-b:a", "12.2k", outputPath];
+        return [
+          "-i", inputPath,
+          "-vn",
+          "-c:a", "libopencore_amrnb",
+          "-ar", "8000",
+          "-ac", "1",
+          "-b:a", "12.2k",
+          outputPath,
+        ];
+
       default:
         return null;
     }
@@ -150,26 +221,79 @@ function buildFfmpegArgs(inputPath, target, outputPath) {
   if (VIDEO_FORMATS.has(target)) {
     switch (target) {
       case "mp4":
-        return ["-i", inputPath, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", "-movflags", "+faststart", outputPath];
-      case "webm":
-        return ["-i", inputPath, "-c:v", "libvpx-vp9", "-crf", "32", "-b:v", "0", "-c:a", "libopus", outputPath];
       case "mov":
-        return ["-i", inputPath, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", outputPath];
       case "mkv":
-        return ["-i", inputPath, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", outputPath];
-      case "avi":
-        return ["-i", inputPath, "-c:v", "mpeg4", "-q:v", "5", "-c:a", "libmp3lame", outputPath];
-      case "wmv":
-        return ["-i", inputPath, "-c:v", "wmv2", "-c:a", "wmav2", outputPath];
-      case "flv":
-        return ["-i", inputPath, "-c:v", "flv", "-c:a", "libmp3lame", outputPath];
       case "m4v":
-        return ["-i", inputPath, "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-c:a", "aac", outputPath];
+        return [
+          "-i", inputPath,
+          "-c:v", "libx264",
+          "-preset", "ultrafast",
+          "-crf", "26",
+          "-c:a", "aac",
+          "-b:a", "128k",
+          ...(target === "mp4" ? ["-movflags", "+faststart"] : []),
+          outputPath,
+        ];
+
+      case "webm":
+        return [
+          "-i", inputPath,
+          "-c:v", "libvpx-vp9",
+          "-crf", "36",
+          "-b:v", "0",
+          "-deadline", "realtime",
+          "-cpu-used", "5",
+          "-c:a", "libopus",
+          "-b:a", "128k",
+          outputPath,
+        ];
+
+      case "avi":
+        return [
+          "-i", inputPath,
+          "-c:v", "mpeg4",
+          "-q:v", "7",
+          "-c:a", "libmp3lame",
+          "-q:a", "4",
+          outputPath,
+        ];
+
+      case "wmv":
+        return [
+          "-i", inputPath,
+          "-c:v", "wmv2",
+          "-c:a", "wmav2",
+          outputPath,
+        ];
+
+      case "flv":
+        return [
+          "-i", inputPath,
+          "-c:v", "flv",
+          "-c:a", "libmp3lame",
+          outputPath,
+        ];
+
       case "mpg":
       case "mpeg":
-        return ["-i", inputPath, "-c:v", "mpeg2video", "-q:v", "5", "-c:a", "mp2", outputPath];
+        return [
+          "-i", inputPath,
+          "-c:v", "mpeg2video",
+          "-q:v", "7",
+          "-c:a", "mp2",
+          outputPath,
+        ];
+
       case "3gp":
-        return ["-i", inputPath, "-c:v", "h263", "-c:a", "aac", "-ar", "8000", "-ac", "1", outputPath];
+        return [
+          "-i", inputPath,
+          "-c:v", "h263",
+          "-c:a", "aac",
+          "-ar", "8000",
+          "-ac", "1",
+          outputPath,
+        ];
+
       default:
         return null;
     }
@@ -178,7 +302,12 @@ function buildFfmpegArgs(inputPath, target, outputPath) {
   if (IMAGE_FORMATS.has(target)) {
     switch (target) {
       case "gif":
-        return ["-i", inputPath, "-vf", "fps=12,scale=iw:-1:flags=lanczos", outputPath];
+        return [
+          "-i", inputPath,
+          "-vf", "fps=10,scale=iw:-1:flags=lanczos",
+          outputPath,
+        ];
+
       case "png":
       case "jpg":
       case "webp":
@@ -186,7 +315,12 @@ function buildFfmpegArgs(inputPath, target, outputPath) {
       case "tiff":
       case "ico":
       case "avif":
-        return ["-i", inputPath, "-frames:v", "1", outputPath];
+        return [
+          "-i", inputPath,
+          "-frames:v", "1",
+          outputPath,
+        ];
+
       default:
         return null;
     }
@@ -199,32 +333,42 @@ app.get("/", (req, res) => {
   res.send("Converto API running");
 });
 
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "converto-server",
+    ffmpegPath: ffmpegInstaller.path,
+    uptimeSeconds: Math.round(process.uptime()),
+  });
+});
+
 app.post("/convert", upload.single("file"), (req, res) => {
   if (!req.file) {
     return res.status(400).json({ error: "No file uploaded." });
   }
 
+  const startedAt = Date.now();
   const target = normalizeTarget(req.body.target);
   const originalName = req.file.originalname || "";
   const inputExt = detectInputExt(originalName);
   const inputPath = req.file.path;
   const outputPath = `${inputPath}.${target}`;
-  const downloadName = `${path.parse(originalName).name || "output"}_converto.${target}`;
+  const downloadName = buildOutputName(originalName, target);
 
   if (!isSupportedTarget(target)) {
-    safeUnlink(inputPath);
+    cleanupFiles(inputPath);
     return res.status(400).json({ error: "Unsupported target format." });
   }
 
   if (inputExt && inputExt === target) {
-    safeUnlink(inputPath);
+    cleanupFiles(inputPath);
     return res.status(400).json({ error: "Input and output formats are the same." });
   }
 
   const ffmpegArgs = buildFfmpegArgs(inputPath, target, outputPath);
 
   if (!ffmpegArgs) {
-    safeUnlink(inputPath);
+    cleanupFiles(inputPath);
     return res.status(400).json({ error: "This conversion path is not supported yet." });
   }
 
@@ -232,32 +376,39 @@ app.post("/convert", upload.single("file"), (req, res) => {
     from: inputExt || "unknown",
     to: target,
     file: originalName,
+    sizeMB: Number((req.file.size / (1024 * 1024)).toFixed(2)),
   });
 
-  const ffmpeg = spawn(ffmpegInstaller.path, ["-y", ...ffmpegArgs]);
+  const ffmpeg = spawn(ffmpegInstaller.path, ["-y", ...ffmpegArgs], {
+    stdio: ["ignore", "ignore", "pipe"],
+  });
 
   let ffmpegErrorLog = "";
+  let responseFinished = false;
 
   ffmpeg.stderr.on("data", (data) => {
-    const text = data.toString();
-    ffmpegErrorLog += text;
-    console.log(text);
+    ffmpegErrorLog += data.toString();
   });
 
   ffmpeg.on("error", (error) => {
     console.error("FFmpeg spawn error:", error);
-    safeUnlink(inputPath);
-    safeUnlink(outputPath);
-    return res.status(500).json({ error: "FFmpeg could not be started." });
+    cleanupFiles(inputPath, outputPath);
+
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "FFmpeg could not be started." });
+    }
   });
 
   ffmpeg.on("close", (code) => {
     if (code !== 0) {
       console.error("FFmpeg exit code:", code);
       console.error(ffmpegErrorLog);
-      safeUnlink(inputPath);
-      safeUnlink(outputPath);
-      return res.status(500).json({ error: "Conversion failed." });
+      cleanupFiles(inputPath, outputPath);
+
+      if (!res.headersSent) {
+        return res.status(500).json({ error: "Conversion failed." });
+      }
+      return;
     }
 
     const mimeType = MIME_MAP[target] || "application/octet-stream";
@@ -266,26 +417,46 @@ app.post("/convert", upload.single("file"), (req, res) => {
     res.setHeader("Content-Disposition", `attachment; filename="${downloadName}"`);
 
     const stream = fs.createReadStream(outputPath);
-    stream.pipe(res);
 
-    stream.on("close", () => {
-      safeUnlink(inputPath);
-      safeUnlink(outputPath);
-    });
+    const finalizeCleanup = () => {
+      if (responseFinished) return;
+      responseFinished = true;
+
+      const durationMs = Date.now() - startedAt;
+      console.log("Conversion finished:", {
+        from: inputExt || "unknown",
+        to: target,
+        file: originalName,
+        durationMs,
+        durationSec: Number((durationMs / 1000).toFixed(2)),
+      });
+
+      cleanupFiles(inputPath, outputPath);
+    };
 
     stream.on("error", (streamErr) => {
       console.error("Stream error:", streamErr);
-      safeUnlink(inputPath);
-      safeUnlink(outputPath);
+      cleanupFiles(inputPath, outputPath);
+
       if (!res.headersSent) {
         return res.status(500).json({ error: "File streaming failed." });
       }
+
       res.end();
     });
+
+    res.on("close", finalizeCleanup);
+    res.on("finish", finalizeCleanup);
+
+    stream.pipe(res);
   });
 });
 
 app.use((err, req, res, next) => {
+  if (req?.file?.path) {
+    cleanupFiles(req.file.path);
+  }
+
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
       return res.status(400).json({ error: "File is too large. Max 100MB." });
