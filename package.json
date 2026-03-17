@@ -1,21 +1,9 @@
 {
   "name": "converto-server",
   "version": "1.0.0",
-<<<<<<< HEAD
-  "description": "",
+  "description": "Converto backend conversion server",
   "main": "index.js",
-  "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
-  },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
   "type": "commonjs",
-  "dependencies": {
-    "express": "^5.2.1",
-    "multer": "^2.1.1"
-=======
-  "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
@@ -24,6 +12,5 @@
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "multer": "^1.4.5-lts.1"
->>>>>>> 1ea03ce9b207b4a2ce44b1ed61563eca38700e34
   }
 }
