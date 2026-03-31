@@ -174,6 +174,40 @@ function isValidTimeValue(value) {
   );
 }
 
+function timeToSeconds(value) {
+  if (!value) return null;
+
+  const raw = String(value).trim();
+
+  if (/^\d+(\.\d+)?$/.test(raw)) {
+    const numeric = Number(raw);
+    return Number.isFinite(numeric) ? numeric : null;
+  }
+
+  const parts = raw.split(":").map((part) => Number(part));
+  if (parts.some((part) => !Number.isFinite(part))) return null;
+
+  if (parts.length === 2) {
+    const [minutes, seconds] = parts;
+    return minutes * 60 + seconds;
+  }
+
+  if (parts.length === 3) {
+    const [hours, minutes, seconds] = parts;
+    return hours * 3600 + minutes * 60 + seconds;
+  }
+
+  return null;
+}
+
+function isTruthy(value) {
+  const v = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  return v === "true" || v === "1" || v === "yes" || v === "on";
+}
+
 function normalizeAudioBitrate(value) {
   const v = String(value || "")
     .trim()
@@ -378,17 +412,16 @@ function getJpgQValue(imageQuality) {
   );
 }
 
-function isTruthy(value) {
-  const v = String(value || "")
-    .trim()
-    .toLowerCase();
-
-  return v === "true" || v === "1" || v === "yes" || v === "on";
-}
-
 function parseConversionOptions(body = {}, target = "") {
-  const trimStart = normalizeTimeValue(body.trimStart || body.startTime);
-  const trimEnd = normalizeTimeValue(body.trimEnd || body.endTime);
+  const trimEnabled = isTruthy(body.trimEnabled);
+
+  const trimStart = trimEnabled
+    ? normalizeTimeValue(body.trimStart || body.startTime)
+    : null;
+
+  const trimEnd = trimEnabled
+    ? normalizeTimeValue(body.trimEnd || body.endTime)
+    : null;
 
   const audioBitrate = normalizeAudioBitrate(body.audioBitrate || body.bitrate);
   const audioSampleRate = normalizeAudioSampleRate(
@@ -413,8 +446,11 @@ function parseConversionOptions(body = {}, target = "") {
   const muteAudio = isTruthy(body.muteAudio);
 
   return {
+    trimEnabled,
     trimStart,
     trimEnd,
+    trimStartSeconds: trimStart ? timeToSeconds(trimStart) : null,
+    trimEndSeconds: trimEnd ? timeToSeconds(trimEnd) : null,
     audioBitrate,
     audioSampleRate,
     audioChannels,
@@ -432,20 +468,40 @@ function parseConversionOptions(body = {}, target = "") {
 }
 
 function validateOptions(options, target, entitlement = { isPro: false }) {
-  if (!isValidTimeValue(options.trimStart)) {
-    return "Invalid trim start value.";
-  }
+  if (options.trimEnabled) {
+    if (!options.trimStart || !options.trimEnd) {
+      return "Trim start and trim end are required when trim is enabled.";
+    }
 
-  if (!isValidTimeValue(options.trimEnd)) {
-    return "Invalid trim end value.";
-  }
+    if (!isValidTimeValue(options.trimStart)) {
+      return "Invalid trim start value.";
+    }
 
-  if (
-    (options.trimStart || options.trimEnd) &&
-    IMAGE_FORMATS.has(target) &&
-    target !== "gif"
-  ) {
-    return "Trim is only supported for audio and video conversions.";
+    if (!isValidTimeValue(options.trimEnd)) {
+      return "Invalid trim end value.";
+    }
+
+    if (
+      !Number.isFinite(options.trimStartSeconds) ||
+      !Number.isFinite(options.trimEndSeconds)
+    ) {
+      return "Trim values could not be parsed.";
+    }
+
+    if (options.trimStartSeconds < 0 || options.trimEndSeconds < 0) {
+      return "Trim values must be positive.";
+    }
+
+    if (options.trimEndSeconds <= options.trimStartSeconds) {
+      return "Trim end must be greater than trim start.";
+    }
+
+    if (
+      IMAGE_FORMATS.has(target) &&
+      target !== "gif"
+    ) {
+      return "Trim is only supported for audio, video, and GIF conversions.";
+    }
   }
 
   if (
@@ -584,18 +640,43 @@ function resolveEntitlement(req) {
   };
 }
 
-function buildTrimArgs(trimStart, trimEnd) {
-  const args = [];
-
-  if (trimStart) {
-    args.push("-ss", trimStart);
+function buildTrimArgs(options) {
+  if (!options.trimEnabled) {
+    return {
+      inputPrefixArgs: [],
+      outputTimingArgs: [],
+    };
   }
 
-  args.push("-i");
+  const start = options.trimStartSeconds;
+  const end = options.trimEndSeconds;
+
+  if (Number.isFinite(start) && Number.isFinite(end)) {
+    const duration = Math.max(0, end - start);
+
+    return {
+      inputPrefixArgs: ["-ss", String(start)],
+      outputTimingArgs: ["-t", String(duration)],
+    };
+  }
+
+  if (Number.isFinite(start)) {
+    return {
+      inputPrefixArgs: ["-ss", String(start)],
+      outputTimingArgs: [],
+    };
+  }
+
+  if (Number.isFinite(end)) {
+    return {
+      inputPrefixArgs: [],
+      outputTimingArgs: ["-to", String(end)],
+    };
+  }
 
   return {
-    inputArgs: args,
-    outputArgs: trimEnd ? ["-to", trimEnd] : [],
+    inputPrefixArgs: [],
+    outputTimingArgs: [],
   };
 }
 
@@ -742,9 +823,9 @@ function buildIcoPixelFormatArgs(iconBitDepth) {
 }
 
 function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
-  const trimArgs = buildTrimArgs(options.trimStart, options.trimEnd);
-  const inputArgs = [...trimArgs.inputArgs, inputPath];
-  const extraOutputArgs = [...trimArgs.outputArgs];
+  const trimArgs = buildTrimArgs(options);
+  const inputArgs = [...trimArgs.inputPrefixArgs, "-i", inputPath];
+  const extraOutputArgs = [...trimArgs.outputTimingArgs];
 
   if (AUDIO_FORMATS.has(target)) {
     switch (target) {
@@ -1234,8 +1315,11 @@ app.post("/convert", upload.single("file"), (req, res) => {
     to: target,
     file: originalName,
     sizeMB: Number((req.file.size / (1024 * 1024)).toFixed(2)),
+    trimEnabled: options.trimEnabled,
     trimStart: options.trimStart,
     trimEnd: options.trimEnd,
+    trimStartSeconds: options.trimStartSeconds,
+    trimEndSeconds: options.trimEndSeconds,
     audioBitrate: options.audioBitrate,
     audioSampleRate: options.audioSampleRate,
     audioChannels: options.audioChannels,
