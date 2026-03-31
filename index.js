@@ -22,6 +22,7 @@ app.use(
     exposedHeaders: ["Content-Disposition", "Content-Type"],
   })
 );
+
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true, limit: "10mb" }));
 
@@ -104,6 +105,23 @@ const MIME_MAP = {
   avif: "image/avif",
 };
 
+function getFirstHeaderValue(value) {
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+  return value;
+}
+
+function getUserTier(userId) {
+  const normalizedUserId = String(getFirstHeaderValue(userId) || "").trim();
+
+  if (normalizedUserId === "user_3Bfa3QpE3MCJzYTIIvMkFJlFmwo") {
+    return "pro";
+  }
+
+  return "free";
+}
+
 function safeUnlink(filePath) {
   if (!filePath) return;
   fs.unlink(filePath, () => {});
@@ -149,6 +167,7 @@ function normalizeTimeValue(value) {
 
 function isValidTimeValue(value) {
   if (!value) return true;
+
   return (
     /^(\d{1,2}:)?\d{1,2}:\d{1,2}(\.\d+)?$/.test(value) ||
     /^\d+(\.\d+)?$/.test(value)
@@ -159,6 +178,7 @@ function normalizeAudioBitrate(value) {
   const v = String(value || "")
     .trim()
     .toLowerCase();
+
   if (!v) return null;
 
   const allowed = new Set([
@@ -194,8 +214,8 @@ function normalizeVideoResolution(value) {
   const v = String(value || "")
     .trim()
     .toLowerCase();
-  if (!v) return null;
 
+  if (!v) return null;
   if (v === "2160p") return "4k";
 
   const allowed = new Set([
@@ -216,6 +236,7 @@ function normalizeVideoCodec(value, target) {
   const v = String(value || "")
     .trim()
     .toLowerCase();
+
   if (!v) return null;
 
   if (target === "webm") {
@@ -231,6 +252,7 @@ function normalizeVideoQuality(value) {
   const v = String(value || "")
     .trim()
     .toLowerCase();
+
   if (!v) return null;
 
   const allowed = new Set(["high", "balanced", "small"]);
@@ -360,6 +382,7 @@ function isTruthy(value) {
   const v = String(value || "")
     .trim()
     .toLowerCase();
+
   return v === "true" || v === "1" || v === "yes" || v === "on";
 }
 
@@ -504,10 +527,10 @@ function validateOptions(options, target, entitlement = { isPro: false }) {
 
 function getEntitlementFromRequest(req) {
   const headerCandidates = [
-    req.headers["x-user-tier"],
-    req.headers["x-plan-tier"],
-    req.headers["x-tier"],
-    req.headers["x-entitlement-tier"],
+    getFirstHeaderValue(req.headers["x-user-tier"]),
+    getFirstHeaderValue(req.headers["x-plan-tier"]),
+    getFirstHeaderValue(req.headers["x-tier"]),
+    getFirstHeaderValue(req.headers["x-entitlement-tier"]),
   ];
 
   const bodyCandidates = [
@@ -527,8 +550,8 @@ function getEntitlementFromRequest(req) {
 
   const explicitPro =
     isTruthy(req.body?.isPro) ||
-    isTruthy(req.headers["x-user-pro"]) ||
-    isTruthy(req.headers["x-is-pro"]);
+    isTruthy(getFirstHeaderValue(req.headers["x-user-pro"])) ||
+    isTruthy(getFirstHeaderValue(req.headers["x-is-pro"]));
 
   const tier = explicitPro
     ? "pro"
@@ -539,6 +562,25 @@ function getEntitlementFromRequest(req) {
   return {
     tier,
     isPro: tier === "pro",
+  };
+}
+
+function resolveEntitlement(req) {
+  const requestEntitlement = getEntitlementFromRequest(req);
+  const userId = getFirstHeaderValue(req.headers["x-user-id"]);
+  const serverTier = getUserTier(userId);
+
+  if (serverTier === "pro") {
+    return {
+      tier: "pro",
+      isPro: true,
+      source: "server-user-tier",
+    };
+  }
+
+  return {
+    ...requestEntitlement,
+    source: requestEntitlement.isPro ? "request-tier" : "default-free",
   };
 }
 
@@ -656,6 +698,7 @@ function buildGifFilters(options) {
       options.imageWidth,
       options.imageHeight
     );
+
     if (resize) {
       const scaleOnly = resize.replace(/^scale=/, "");
       filters.push(`scale=${scaleOnly}:flags=lanczos`);
@@ -676,6 +719,7 @@ function buildIcoFilters(options) {
     options.imageWidth,
     options.imageHeight
   );
+
   if (baseResize) {
     filters.push(baseResize);
   }
@@ -882,7 +926,17 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "realtime",
           "-cpu-used",
           "5",
-          ...buildVideoAudioArgs(options, "libopus", "128k"),
+          ...(options.muteAudio
+            ? ["-an"]
+            : [
+                "-c:a",
+                "libopus",
+                "-b:a",
+                options.audioBitrate || "128k",
+                "-ar",
+                options.audioSampleRate || "48000",
+                ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
+              ]),
           outputPath,
         ];
       }
@@ -1118,19 +1172,26 @@ app.get("/health", (req, res) => {
 });
 
 app.post("/convert", upload.single("file"), (req, res) => {
-  if (!req.file) {
-    return res.status(400).json({ error: "No file uploaded." });
-  }
-
   const startedAt = Date.now();
-  const entitlement = getEntitlementFromRequest(req);
+
+  const userId = getFirstHeaderValue(req.headers["x-user-id"]);
+  const serverTier = getUserTier(userId);
+  const entitlement = resolveEntitlement(req);
+
+  console.log("USER ID:", userId || "missing");
+  console.log("SERVER TIER:", serverTier);
+  console.log("EFFECTIVE TIER:", entitlement.tier, `(${entitlement.source})`);
+
+  if (!req.file) {
+    return res.status(400).json({ error: "File is required." });
+  }
 
   const target = normalizeTarget(req.body?.target);
   const originalName = req.file.originalname || "";
   const inputExt = detectInputExt(originalName);
   const inputPath = req.file.path;
-  const outputPath = `${inputPath}.${target}`;
-  const downloadName = buildOutputName(originalName, target);
+  const outputPath = `${inputPath}.${target || "tmp"}`;
+  const downloadName = buildOutputName(originalName, target || "bin");
 
   if (!target) {
     cleanupFiles(inputPath);
@@ -1168,6 +1229,7 @@ app.post("/convert", upload.single("file"), (req, res) => {
 
   console.log("Starting conversion:", {
     tier: entitlement.tier,
+    entitlementSource: entitlement.source,
     from: inputExt || "unknown",
     to: target,
     file: originalName,
@@ -1222,7 +1284,10 @@ app.post("/convert", upload.single("file"), (req, res) => {
       finalizeCleanup();
 
       if (!res.headersSent) {
-        return res.status(500).json({ error: "Conversion failed." });
+        return res.status(500).json({
+          error: "Conversion failed.",
+          details: ffmpegErrorLog.slice(-4000),
+        });
       }
       return;
     }
@@ -1268,6 +1333,7 @@ app.post("/convert", upload.single("file"), (req, res) => {
         const durationMs = Date.now() - startedAt;
         console.log("Conversion finished:", {
           tier: entitlement.tier,
+          entitlementSource: entitlement.source,
           from: inputExt || "unknown",
           to: target,
           file: originalName,
