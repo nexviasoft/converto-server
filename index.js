@@ -155,6 +155,22 @@ function isSupportedTarget(target) {
   );
 }
 
+function isAudioSupportedTarget(target) {
+  return AUDIO_FORMATS.has(target) || VIDEO_FORMATS.has(target);
+}
+
+function isVideoSupportedTarget(target) {
+  return VIDEO_FORMATS.has(target);
+}
+
+function isImageSupportedTarget(target) {
+  return IMAGE_FORMATS.has(target);
+}
+
+function isGifTarget(target) {
+  return target === "gif";
+}
+
 function buildOutputName(originalName, target) {
   const base = path.parse(originalName || "output").name || "output";
   return `${base}_converto.${target}`;
@@ -467,6 +483,60 @@ function parseConversionOptions(body = {}, target = "") {
   };
 }
 
+function sanitizeOptionsForTarget(options, target) {
+  const sanitized = { ...options };
+
+  const audioSupported = isAudioSupportedTarget(target);
+  const videoSupported = isVideoSupportedTarget(target);
+  const imageSupported = isImageSupportedTarget(target);
+  const gifTarget = isGifTarget(target);
+  const imageResizeSupported = imageSupported;
+  const imageQualitySupported = ["jpg", "webp", "avif"].includes(target);
+  const iconSupported = target === "ico";
+  const trimSupported = audioSupported || videoSupported || gifTarget;
+
+  if (!audioSupported) {
+    sanitized.audioBitrate = null;
+    sanitized.audioSampleRate = null;
+    sanitized.audioChannels = null;
+  }
+
+  if (!videoSupported && !gifTarget) {
+    sanitized.videoResolution = null;
+    sanitized.videoCodec = null;
+    sanitized.videoQuality = null;
+    sanitized.videoFps = null;
+  }
+
+  if (!videoSupported) {
+    sanitized.muteAudio = false;
+  }
+
+  if (!imageResizeSupported) {
+    sanitized.imageWidth = null;
+    sanitized.imageHeight = null;
+  }
+
+  if (!imageQualitySupported) {
+    sanitized.imageQuality = null;
+  }
+
+  if (!iconSupported) {
+    sanitized.iconSize = null;
+    sanitized.iconBitDepth = null;
+  }
+
+  if (!trimSupported) {
+    sanitized.trimEnabled = false;
+    sanitized.trimStart = null;
+    sanitized.trimEnd = null;
+    sanitized.trimStartSeconds = null;
+    sanitized.trimEndSeconds = null;
+  }
+
+  return sanitized;
+}
+
 function validateOptions(options, target, entitlement = { isPro: false }) {
   if (options.trimEnabled) {
     if (!options.trimStart || !options.trimEnd) {
@@ -496,10 +566,7 @@ function validateOptions(options, target, entitlement = { isPro: false }) {
       return "Trim end must be greater than trim start.";
     }
 
-    if (
-      IMAGE_FORMATS.has(target) &&
-      target !== "gif"
-    ) {
+    if (IMAGE_FORMATS.has(target) && target !== "gif") {
       return "Trim is only supported for audio, video, and GIF conversions.";
     }
   }
@@ -1291,7 +1358,8 @@ app.post("/convert", upload.single("file"), (req, res) => {
       .json({ error: "Input and output formats are the same." });
   }
 
-  const options = parseConversionOptions(req.body, target);
+  const rawOptions = parseConversionOptions(req.body, target);
+  const options = sanitizeOptionsForTarget(rawOptions, target);
   const optionError = validateOptions(options, target, entitlement);
 
   if (optionError) {
