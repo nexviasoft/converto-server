@@ -1518,6 +1518,13 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
     return res.status(400).json({ error: "At least one file is required." });
   }
 
+  if (!entitlement.isPro) {
+    cleanupFiles(...files.map((file) => file.path));
+    return res.status(403).json({
+      error: "Batch conversion is available on Converto Pro.",
+    });
+  }
+
   if (!target) {
     cleanupFiles(...files.map((file) => file.path));
     return res.status(400).json({ error: "Target format is required." });
