@@ -5,6 +5,7 @@ const fs = require("fs");
 const path = require("path");
 const { spawn } = require("child_process");
 const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+const archiver = require("archiver");
 
 const app = express();
 
@@ -821,8 +822,12 @@ function buildImageFilters(options) {
 
 function buildVideoFilters(options) {
   const filters = [];
-  const resolutionFilter = getScaleFilterForResolution(options.videoResolution);
 
+  if (options.videoFps) {
+    filters.push(`fps=${options.videoFps}`);
+  }
+
+  const resolutionFilter = getScaleFilterForResolution(options.videoResolution);
   if (resolutionFilter) {
     filters.push(resolutionFilter);
   }
@@ -1028,7 +1033,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   if (VIDEO_FORMATS.has(target)) {
     const videoFilters = buildVideoFilters(options);
     const vfArgs = videoFilters.length ? ["-vf", videoFilters.join(",")] : [];
-    const fpsArgs = options.videoFps ? ["-r", options.videoFps] : [];
 
     switch (target) {
       case "mp4":
@@ -1042,7 +1046,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           codec,
           "-preset",
@@ -1063,7 +1066,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           codec,
           "-crf",
@@ -1094,7 +1096,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           "mpeg4",
           "-q:v",
@@ -1120,7 +1121,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           "wmv2",
           ...(options.muteAudio
@@ -1140,7 +1140,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           "flv",
           ...(options.muteAudio
@@ -1161,7 +1160,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           "mpeg2video",
           "-q:v",
@@ -1186,7 +1184,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
-          ...fpsArgs,
           "-c:v",
           "h263",
           ...(options.muteAudio
@@ -1300,6 +1297,57 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   return null;
 }
 
+function runFfmpegConversion(inputPath, target, outputPath, options) {
+  return new Promise((resolve, reject) => {
+    const ffmpegArgs = buildFfmpegArgs(inputPath, target, outputPath, options);
+
+    if (!ffmpegArgs) {
+      reject(new Error("This conversion path is not supported yet."));
+      return;
+    }
+
+    const ffmpeg = spawn(ffmpegInstaller.path, ["-y", ...ffmpegArgs], {
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+
+    let ffmpegErrorLog = "";
+
+    ffmpeg.stderr.on("data", (data) => {
+      ffmpegErrorLog += data.toString();
+    });
+
+    ffmpeg.on("error", (error) => {
+      reject(error);
+    });
+
+    ffmpeg.on("close", (code) => {
+      if (code !== 0) {
+        const err = new Error("Conversion failed.");
+        err.details = ffmpegErrorLog.slice(-4000);
+        reject(err);
+        return;
+      }
+
+      fs.stat(outputPath, (statErr, stats) => {
+        if (statErr || !stats || stats.size <= 0) {
+          reject(new Error("Conversion output could not be prepared."));
+          return;
+        }
+
+        resolve({
+          outputPath,
+          size: stats.size,
+        });
+      });
+    });
+  });
+}
+
+function createBatchZipName(target) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return `converto_batch_${target}_${stamp}.zip`;
+}
+
 app.get("/", (req, res) => {
   res.send("Converto API running");
 });
@@ -1319,7 +1367,7 @@ app.get("/health", (req, res) => {
   });
 });
 
-app.post("/convert", upload.single("file"), (req, res) => {
+app.post("/convert", upload.single("file"), async (req, res) => {
   const startedAt = Date.now();
 
   const userId = getFirstHeaderValue(req.headers["x-user-id"]);
@@ -1367,15 +1415,6 @@ app.post("/convert", upload.single("file"), (req, res) => {
     return res.status(400).json({ error: optionError });
   }
 
-  const ffmpegArgs = buildFfmpegArgs(inputPath, target, outputPath, options);
-
-  if (!ffmpegArgs) {
-    cleanupFiles(inputPath);
-    return res
-      .status(400)
-      .json({ error: "This conversion path is not supported yet." });
-  }
-
   console.log("Starting conversion:", {
     tier: entitlement.tier,
     entitlementSource: entitlement.source,
@@ -1403,110 +1442,227 @@ app.post("/convert", upload.single("file"), (req, res) => {
     muteAudio: options.muteAudio,
   });
 
-  const ffmpeg = spawn(ffmpegInstaller.path, ["-y", ...ffmpegArgs], {
-    stdio: ["ignore", "ignore", "pipe"],
-  });
+  try {
+    await runFfmpegConversion(inputPath, target, outputPath, options);
 
-  let ffmpegErrorLog = "";
-  let cleanedUp = false;
+    const mimeType = MIME_MAP[target] || "application/octet-stream";
+    const stats = fs.statSync(outputPath);
 
-  const finalizeCleanup = () => {
-    if (cleanedUp) return;
-    cleanedUp = true;
-    cleanupFiles(inputPath, outputPath);
-  };
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${downloadName}"`
+    );
+    res.setHeader("Content-Length", String(stats.size));
 
-  ffmpeg.stderr.on("data", (data) => {
-    ffmpegErrorLog += data.toString();
-  });
+    const stream = fs.createReadStream(outputPath);
 
-  ffmpeg.on("error", (error) => {
-    console.error("FFmpeg spawn error:", error);
-    finalizeCleanup();
-
-    if (!res.headersSent) {
-      return res.status(500).json({ error: "FFmpeg could not be started." });
-    }
-  });
-
-  ffmpeg.on("close", (code) => {
-    if (code !== 0) {
-      console.error("FFmpeg exit code:", code);
-      console.error(ffmpegErrorLog);
-      finalizeCleanup();
+    stream.on("error", (streamErr) => {
+      console.error("Stream error:", streamErr);
+      cleanupFiles(inputPath, outputPath);
 
       if (!res.headersSent) {
-        return res.status(500).json({
-          error: "Conversion failed.",
-          details: ffmpegErrorLog.slice(-4000),
-        });
+        return res.status(500).json({ error: "File streaming failed." });
       }
-      return;
+
+      try {
+        res.end();
+      } catch (_) {}
+    });
+
+    res.on("finish", () => {
+      const durationMs = Date.now() - startedAt;
+      console.log("Conversion finished:", {
+        tier: entitlement.tier,
+        entitlementSource: entitlement.source,
+        from: inputExt || "unknown",
+        to: target,
+        file: originalName,
+        durationMs,
+        durationSec: Number((durationMs / 1000).toFixed(2)),
+      });
+      cleanupFiles(inputPath, outputPath);
+    });
+
+    res.on("close", () => {
+      cleanupFiles(inputPath, outputPath);
+    });
+
+    stream.pipe(res);
+  } catch (error) {
+    console.error("Conversion failed:", error);
+    cleanupFiles(inputPath, outputPath);
+
+    return res.status(500).json({
+      error: error.message || "Conversion failed.",
+      ...(error.details ? { details: error.details } : {}),
+    });
+  }
+});
+
+app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
+  const startedAt = Date.now();
+
+  const userId = getFirstHeaderValue(req.headers["x-user-id"]);
+  const serverTier = getUserTier(userId);
+  const entitlement = resolveEntitlement(req);
+
+  console.log("BATCH USER ID:", userId || "missing");
+  console.log("BATCH SERVER TIER:", serverTier);
+  console.log("BATCH EFFECTIVE TIER:", entitlement.tier, `(${entitlement.source})`);
+
+  const files = Array.isArray(req.files) ? req.files : [];
+  const target = normalizeTarget(req.body?.target);
+
+  if (!files.length) {
+    return res.status(400).json({ error: "At least one file is required." });
+  }
+
+  if (!target) {
+    cleanupFiles(...files.map((file) => file.path));
+    return res.status(400).json({ error: "Target format is required." });
+  }
+
+  if (!isSupportedTarget(target)) {
+    cleanupFiles(...files.map((file) => file.path));
+    return res.status(400).json({ error: "Unsupported target format." });
+  }
+
+  const rawOptions = parseConversionOptions(req.body, target);
+  const options = sanitizeOptionsForTarget(rawOptions, target);
+  const optionError = validateOptions(options, target, entitlement);
+
+  if (optionError) {
+    cleanupFiles(...files.map((file) => file.path));
+    return res.status(400).json({ error: optionError });
+  }
+
+  const convertedEntries = [];
+  const failedEntries = [];
+
+  for (const file of files) {
+    const originalName = file.originalname || "";
+    const inputExt = detectInputExt(originalName);
+    const inputPath = file.path;
+    const outputPath = `${inputPath}.${target}`;
+    const downloadName = buildOutputName(originalName, target);
+
+    if (inputExt && inputExt === target) {
+      failedEntries.push({
+        file: originalName,
+        reason: "Input and output formats are the same.",
+      });
+      cleanupFiles(inputPath);
+      continue;
     }
 
-    fs.stat(outputPath, (statErr, stats) => {
-      if (statErr || !stats || stats.size <= 0) {
-        console.error("Output file missing or empty:", statErr);
-        finalizeCleanup();
-
-        if (!res.headersSent) {
-          return res
-            .status(500)
-            .json({ error: "Conversion output could not be prepared." });
-        }
-        return;
-      }
-
-      const mimeType = MIME_MAP[target] || "application/octet-stream";
-
-      res.setHeader("Content-Type", mimeType);
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="${downloadName}"`
-      );
-      res.setHeader("Content-Length", String(stats.size));
-
-      const stream = fs.createReadStream(outputPath);
-
-      stream.on("error", (streamErr) => {
-        console.error("Stream error:", streamErr);
-        finalizeCleanup();
-
-        if (!res.headersSent) {
-          return res.status(500).json({ error: "File streaming failed." });
-        }
-
-        try {
-          res.end();
-        } catch (_) {}
+    try {
+      console.log("Starting batch item:", {
+        tier: entitlement.tier,
+        entitlementSource: entitlement.source,
+        from: inputExt || "unknown",
+        to: target,
+        file: originalName,
+        sizeMB: Number((file.size / (1024 * 1024)).toFixed(2)),
+        videoFps: options.videoFps,
       });
 
-      res.on("finish", () => {
-        const durationMs = Date.now() - startedAt;
-        console.log("Conversion finished:", {
-          tier: entitlement.tier,
-          entitlementSource: entitlement.source,
-          from: inputExt || "unknown",
-          to: target,
-          file: originalName,
-          durationMs,
-          durationSec: Number((durationMs / 1000).toFixed(2)),
-        });
-        finalizeCleanup();
-      });
+      await runFfmpegConversion(inputPath, target, outputPath, options);
 
-      res.on("close", () => {
-        finalizeCleanup();
+      convertedEntries.push({
+        inputPath,
+        outputPath,
+        downloadName,
+        originalName,
       });
+    } catch (error) {
+      console.error("Batch item failed:", originalName, error);
+      failedEntries.push({
+        file: originalName,
+        reason: error.message || "Conversion failed.",
+      });
+      cleanupFiles(inputPath, outputPath);
+    }
+  }
 
-      stream.pipe(res);
+  if (!convertedEntries.length) {
+    cleanupFiles(...files.map((file) => file.path));
+    return res.status(500).json({
+      error: "All batch conversions failed.",
+      failed: failedEntries,
     });
+  }
+
+  const zipName = createBatchZipName(target);
+
+  res.setHeader("Content-Type", "application/zip");
+  res.setHeader("Content-Disposition", `attachment; filename="${zipName}"`);
+
+  const archive = archiver("zip", {
+    zlib: { level: 9 },
   });
+
+  archive.on("error", (error) => {
+    console.error("ZIP creation failed:", error);
+    cleanupFiles(
+      ...convertedEntries.flatMap((entry) => [entry.inputPath, entry.outputPath])
+    );
+
+    if (!res.headersSent) {
+      res.status(500).json({ error: "ZIP creation failed." });
+    } else {
+      try {
+        res.end();
+      } catch (_) {}
+    }
+  });
+
+  res.on("finish", () => {
+    const durationMs = Date.now() - startedAt;
+    console.log("Batch conversion finished:", {
+      tier: entitlement.tier,
+      entitlementSource: entitlement.source,
+      target,
+      successCount: convertedEntries.length,
+      failedCount: failedEntries.length,
+      durationMs,
+      durationSec: Number((durationMs / 1000).toFixed(2)),
+      failedEntries,
+    });
+
+    cleanupFiles(
+      ...convertedEntries.flatMap((entry) => [entry.inputPath, entry.outputPath])
+    );
+  });
+
+  res.on("close", () => {
+    cleanupFiles(
+      ...convertedEntries.flatMap((entry) => [entry.inputPath, entry.outputPath])
+    );
+  });
+
+  archive.pipe(res);
+
+  for (const entry of convertedEntries) {
+    archive.file(entry.outputPath, { name: entry.downloadName });
+  }
+
+  if (failedEntries.length) {
+    archive.append(JSON.stringify(failedEntries, null, 2), {
+      name: "failed.json",
+    });
+  }
+
+  await archive.finalize();
 });
 
 app.use((err, req, res, next) => {
   if (req?.file?.path) {
     cleanupFiles(req.file.path);
+  }
+
+  if (Array.isArray(req?.files)) {
+    cleanupFiles(...req.files.map((file) => file.path));
   }
 
   if (err instanceof multer.MulterError) {
