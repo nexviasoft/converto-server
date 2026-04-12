@@ -820,19 +820,24 @@ function buildImageFilters(options) {
   return filters;
 }
 
+// FPS DEĞİŞİKLİĞİ: fps filtresini video filtreleri içinde değil,
+// ayrı bir fps argümanı olarak output'a ekliyoruz.
+// Bu sayede FFmpeg kaynak FPS'i gerçekten override eder.
 function buildVideoFilters(options) {
   const filters = [];
 
-  if (options.videoFps) {
-    filters.push(`fps=${options.videoFps}`);
-  }
-
+  // fps artık -r flag ile verildiği için buraya eklenmez
   const resolutionFilter = getScaleFilterForResolution(options.videoResolution);
   if (resolutionFilter) {
     filters.push(resolutionFilter);
   }
 
   return filters;
+}
+
+function buildVideoFpsArgs(options) {
+  if (!options.videoFps) return [];
+  return ["-r", options.videoFps];
 }
 
 function buildGifFilters(options) {
@@ -1033,6 +1038,8 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   if (VIDEO_FORMATS.has(target)) {
     const videoFilters = buildVideoFilters(options);
     const vfArgs = videoFilters.length ? ["-vf", videoFilters.join(",")] : [];
+    // FPS artık -r flag ile ayrıca ekleniyor — vf fps= yerine bu daha güvenilir
+    const fpsArgs = buildVideoFpsArgs(options);
 
     switch (target) {
       case "mp4":
@@ -1046,6 +1053,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           codec,
           "-preset",
@@ -1066,6 +1074,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           codec,
           "-crf",
@@ -1096,6 +1105,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           "mpeg4",
           "-q:v",
@@ -1121,6 +1131,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           "wmv2",
           ...(options.muteAudio
@@ -1140,6 +1151,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           "flv",
           ...(options.muteAudio
@@ -1160,6 +1172,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           "mpeg2video",
           "-q:v",
@@ -1184,6 +1197,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...inputArgs,
           ...extraOutputArgs,
           ...vfArgs,
+          ...fpsArgs,
           "-c:v",
           "h263",
           ...(options.muteAudio
@@ -1500,6 +1514,9 @@ app.post("/convert", upload.single("file"), async (req, res) => {
   }
 });
 
+// Free: max 5 dosya, Pro: max 25 dosya
+const FREE_BATCH_LIMIT = 5;
+
 app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
   const startedAt = Date.now();
 
@@ -1518,10 +1535,10 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
     return res.status(400).json({ error: "At least one file is required." });
   }
 
-  if (!entitlement.isPro) {
+  if (!entitlement.isPro && files.length > FREE_BATCH_LIMIT) {
     cleanupFiles(...files.map((file) => file.path));
     return res.status(403).json({
-      error: "Batch conversion is available on Converto Pro.",
+      error: `Free plan supports up to ${FREE_BATCH_LIMIT} files per batch. Upgrade to Pro for unlimited batch conversion.`,
     });
   }
 
