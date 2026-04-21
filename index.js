@@ -6,6 +6,7 @@ const path = require("path");
 const { spawn } = require("child_process");
 const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const archiver = require("archiver");
+const { PDFDocument } = require("pdf-lib");
 
 const app = express();
 
@@ -72,6 +73,9 @@ const IMAGE_FORMATS = new Set([
   "avif",
 ]);
 
+// Frontend'deki PDF_TO_IMAGE_TARGETS ile eşleşen set
+const PDF_TO_IMAGE_FORMATS = new Set(["png", "jpg", "webp"]);
+
 const MIME_MAP = {
   mp3: "audio/mpeg",
   wav: "audio/wav",
@@ -132,6 +136,61 @@ function cleanupFiles(...paths) {
   for (const p of paths) {
     safeUnlink(p);
   }
+}
+
+function parsePdfPageRange(input, maxPages) {
+  if (!input || typeof input !== "string") {
+    throw new Error("Page range is required.");
+  }
+
+  const parts = input.split(",");
+  const pages = new Set();
+
+  for (const rawPart of parts) {
+    const part = String(rawPart || "").trim();
+    if (!part) continue;
+
+    if (part.includes("-")) {
+      const [startRaw, endRaw] = part.split("-").map((v) => v.trim());
+      const start = Number(startRaw);
+      const end = Number(endRaw);
+
+      if (!Number.isInteger(start) || !Number.isInteger(end)) {
+        throw new Error(`Invalid range: ${part}`);
+      }
+
+      if (start < 1 || end < 1 || start > end) {
+        throw new Error(`Invalid range: ${part}`);
+      }
+
+      for (let i = start; i <= end; i += 1) {
+        if (i > maxPages) {
+          throw new Error(`Page ${i} exceeds PDF page count (${maxPages}).`);
+        }
+        pages.add(i - 1);
+      }
+    } else {
+      const page = Number(part);
+
+      if (!Number.isInteger(page) || page < 1) {
+        throw new Error(`Invalid page: ${part}`);
+      }
+
+      if (page > maxPages) {
+        throw new Error(`Page ${page} exceeds PDF page count (${maxPages}).`);
+      }
+
+      pages.add(page - 1);
+    }
+  }
+
+  const ordered = Array.from(pages).sort((a, b) => a - b);
+
+  if (!ordered.length) {
+    throw new Error("No valid pages selected.");
+  }
+
+  return ordered;
 }
 
 function normalizeTarget(value) {
@@ -820,13 +879,9 @@ function buildImageFilters(options) {
   return filters;
 }
 
-// FPS DEĞİŞİKLİĞİ: fps filtresini video filtreleri içinde değil,
-// ayrı bir fps argümanı olarak output'a ekliyoruz.
-// Bu sayede FFmpeg kaynak FPS'i gerçekten override eder.
 function buildVideoFilters(options) {
   const filters = [];
 
-  // fps artık -r flag ile verildiği için buraya eklenmez
   const resolutionFilter = getScaleFilterForResolution(options.videoResolution);
   if (resolutionFilter) {
     filters.push(resolutionFilter);
@@ -1038,7 +1093,6 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   if (VIDEO_FORMATS.has(target)) {
     const videoFilters = buildVideoFilters(options);
     const vfArgs = videoFilters.length ? ["-vf", videoFilters.join(",")] : [];
-    // FPS artık -r flag ile ayrıca ekleniyor — vf fps= yerine bu daha güvenilir
     const fpsArgs = buildVideoFpsArgs(options);
 
     switch (target) {
@@ -1320,14 +1374,18 @@ function runFfmpegConversion(inputPath, target, outputPath, options) {
       return;
     }
 
-    const ffmpeg = spawn(ffmpegInstaller.path, ["-y", ...ffmpegArgs], {
-      stdio: ["ignore", "ignore", "pipe"],
-    });
+    const ffmpeg = spawn(ffmpegInstaller.path, [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      ...ffmpegArgs,
+    ]);
 
-    let ffmpegErrorLog = "";
+    let stderr = "";
 
-    ffmpeg.stderr.on("data", (data) => {
-      ffmpegErrorLog += data.toString();
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
     });
 
     ffmpeg.on("error", (error) => {
@@ -1335,24 +1393,57 @@ function runFfmpegConversion(inputPath, target, outputPath, options) {
     });
 
     ffmpeg.on("close", (code) => {
-      if (code !== 0) {
-        const err = new Error("Conversion failed.");
-        err.details = ffmpegErrorLog.slice(-4000);
-        reject(err);
-        return;
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(stderr || `FFmpeg exited with code ${code}`));
       }
+    });
+  });
+}
 
-      fs.stat(outputPath, (statErr, stats) => {
-        if (statErr || !stats || stats.size <= 0) {
-          reject(new Error("Conversion output could not be prepared."));
-          return;
-        }
+// ─── PDF sayfasını FFmpeg ile image'a dönüştür ───────────────────────────────
+// mutool (mupdf-tools) ile PDF sayfasını raster PNG'ye çevirir,
+// ardından isteğe göre JPG/WEBP'e dönüştürür.
+function renderPdfPageWithFfmpeg(inputPath, pageIndex, outputPath, targetFmt) {
+  return new Promise((resolve, reject) => {
+    // FFmpeg'in PDF decoder'ı (libgs / Ghostscript) gerektirir.
+    // Render için sayfa seçimi: -page_index flag'i ile.
+    const args = [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      "-i",
+      inputPath,
+      "-vf",
+      `select=eq(n\\,${pageIndex})`,
+      "-frames:v",
+      "1",
+    ];
 
-        resolve({
-          outputPath,
-          size: stats.size,
-        });
-      });
+    if (targetFmt === "jpg") {
+      args.push("-q:v", "3");
+    } else if (targetFmt === "webp") {
+      args.push("-quality", "92");
+    }
+
+    args.push(outputPath);
+
+    const ffmpeg = spawn(ffmpegInstaller.path, args);
+    let stderr = "";
+
+    ffmpeg.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+
+    ffmpeg.on("error", reject);
+    ffmpeg.on("close", (code) => {
+      if (code === 0) {
+        resolve();
+      } else {
+        reject(new Error(stderr || `FFmpeg exited with code ${code}`));
+      }
     });
   });
 }
@@ -1362,62 +1453,237 @@ function createBatchZipName(target) {
   return `converto_batch_${target}_${stamp}.zip`;
 }
 
-app.get("/", (req, res) => {
-  res.send("Converto API running");
+// ─── Routes ──────────────────────────────────────────────────────────────────
+
+app.get("/", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "converto-server",
+    message: "FFmpeg conversion backend is running.",
+  });
 });
 
-app.get("/health", (req, res) => {
+app.get("/health", (_req, res) => {
   res.json({
     ok: true,
     service: "converto-server",
     ffmpegPath: ffmpegInstaller.path,
-    uptimeSeconds: Math.round(process.uptime()),
-    maxUploadMb: 1000,
-    targets: {
-      audio: Array.from(AUDIO_FORMATS),
-      video: Array.from(VIDEO_FORMATS),
-      image: Array.from(IMAGE_FORMATS),
-    },
+    uploadDir,
+    supportedTargets: [
+      ...Array.from(AUDIO_FORMATS),
+      ...Array.from(VIDEO_FORMATS),
+      ...Array.from(IMAGE_FORMATS),
+    ],
   });
 });
 
-app.post("/convert", upload.single("file"), async (req, res) => {
-  const startedAt = Date.now();
+// ─── /pdf/split (mevcut, korundu) ────────────────────────────────────────────
+app.post("/pdf/split", upload.single("file"), async (req, res) => {
+  const file = req.file;
+  const range = String(req.body?.range || "").trim();
 
-  const userId = getFirstHeaderValue(req.headers["x-user-id"]);
-  const serverTier = getUserTier(userId);
-  const entitlement = resolveEntitlement(req);
-
-  console.log("USER ID:", userId || "missing");
-  console.log("SERVER TIER:", serverTier);
-  console.log("EFFECTIVE TIER:", entitlement.tier, `(${entitlement.source})`);
-
-  if (!req.file) {
-    return res.status(400).json({ error: "File is required." });
+  if (!file) {
+    return res.status(400).json({ error: "PDF file is required." });
   }
 
-  const target = normalizeTarget(req.body?.target);
-  const originalName = req.file.originalname || "";
-  const inputExt = detectInputExt(originalName);
-  const inputPath = req.file.path;
-  const outputPath = `${inputPath}.${target || "tmp"}`;
-  const downloadName = buildOutputName(originalName, target || "bin");
+  if (!range) {
+    cleanupFiles(file.path);
+    return res.status(400).json({ error: "Page range is required." });
+  }
+
+  try {
+    const pdfBytes = fs.readFileSync(file.path);
+    const originalPdf = await PDFDocument.load(pdfBytes);
+    const totalPages = originalPdf.getPageCount();
+
+    const selectedPages = parsePdfPageRange(range, totalPages);
+
+    const newPdf = await PDFDocument.create();
+    const copiedPages = await newPdf.copyPages(originalPdf, selectedPages);
+
+    copiedPages.forEach((page) => newPdf.addPage(page));
+
+    const newPdfBytes = await newPdf.save();
+
+    const outputPath = path.join(uploadDir, `split_${Date.now()}.pdf`);
+    fs.writeFileSync(outputPath, newPdfBytes);
+
+    const baseName = (file.originalname || "document").replace(/\.pdf$/i, "");
+    const downloadName = `${baseName}-split.pdf`;
+
+    res.download(outputPath, downloadName, () => {
+      cleanupFiles(file.path, outputPath);
+    });
+  } catch (error) {
+    console.error("Split PDF error:", error);
+    cleanupFiles(file.path);
+    return res.status(400).json({
+      error: error?.message || "Split PDF failed.",
+    });
+  }
+});
+
+// ─── /pdf/to-images (YENİ — frontend'deki /pdf/to-images endpoint'i) ─────────
+// Frontend: POST ${API_URL}/pdf/to-images
+// FormData: file (PDF), target (png | jpg | webp)
+// Yanıt: Tek sayfalıysa doğrudan image dosyası,
+//         çok sayfalıysa ZIP (her sayfa ayrı dosya)
+app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
+  const file = req.file;
+  const rawTarget = normalizeTarget(req.body?.target || "png");
+
+  if (!file) {
+    return res.status(400).json({ error: "PDF file is required." });
+  }
+
+  const isPdf =
+    file.mimetype === "application/pdf" ||
+    (file.originalname || "").toLowerCase().endsWith(".pdf");
+
+  if (!isPdf) {
+    cleanupFiles(file.path);
+    return res.status(400).json({ error: "Only PDF files are supported." });
+  }
+
+  if (!PDF_TO_IMAGE_FORMATS.has(rawTarget)) {
+    cleanupFiles(file.path);
+    return res
+      .status(400)
+      .json({ error: "Supported output formats: png, jpg, webp." });
+  }
+
+  const target = rawTarget; // "png" | "jpg" | "webp"
+  const outputFiles = [];
+
+  try {
+    // pdf-lib ile sayfa sayısını al
+    const pdfBytes = fs.readFileSync(file.path);
+    const pdfDoc = await PDFDocument.load(pdfBytes);
+    const pageCount = pdfDoc.getPageCount();
+
+    if (pageCount === 0) {
+      cleanupFiles(file.path);
+      return res.status(400).json({ error: "PDF has no pages." });
+    }
+
+    const baseName = path.parse(file.originalname || "document").name;
+    const stamp = Date.now();
+
+    // Her sayfa için FFmpeg ile render et
+    for (let i = 0; i < pageCount; i++) {
+      const outputName = `pdf_page_${stamp}_${i + 1}.${target}`;
+      const outputPath = path.join(uploadDir, outputName);
+
+      await renderPdfPageWithFfmpeg(file.path, i, outputPath, target);
+
+      if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+        outputFiles.push({ path: outputPath, name: `${baseName}-page-${i + 1}.${target}` });
+      }
+    }
+
+    if (!outputFiles.length) {
+      cleanupFiles(file.path);
+      return res.status(500).json({ error: "No pages could be rendered." });
+    }
+
+    // Tek sayfa → doğrudan image döndür
+    if (outputFiles.length === 1) {
+      const single = outputFiles[0];
+      const mime = MIME_MAP[target] || "application/octet-stream";
+
+      res.setHeader("Content-Type", mime);
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${single.name}"`
+      );
+
+      res.download(single.path, single.name, () => {
+        cleanupFiles(file.path, single.path);
+      });
+
+      return;
+    }
+
+    // Çok sayfa → ZIP
+    const zipName = `${baseName}-${target}-pages.zip`;
+
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${zipName}"`
+    );
+
+    const archive = archiver("zip", { zlib: { level: 6 } });
+
+    archive.on("error", (err) => {
+      console.error("PDF to image ZIP error:", err);
+      cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+      if (!res.headersSent) {
+        res.status(500).json({ error: "ZIP creation failed." });
+      } else {
+        try { res.end(); } catch (_) {}
+      }
+    });
+
+    res.on("finish", () => {
+      cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+    });
+
+    res.on("close", () => {
+      cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+    });
+
+    archive.pipe(res);
+
+    for (const entry of outputFiles) {
+      archive.file(entry.path, { name: entry.name });
+    }
+
+    await archive.finalize();
+  } catch (error) {
+    console.error("PDF to image error:", error);
+    cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+
+    if (!res.headersSent) {
+      return res.status(500).json({
+        error: error?.message || "PDF to image conversion failed.",
+      });
+    }
+  }
+});
+
+// ─── /convert (mevcut, korundu) ──────────────────────────────────────────────
+app.post("/convert", upload.single("file"), async (req, res) => {
+  const startedAt = Date.now();
+  const file = req.file;
+  const target = normalizeTarget(req.body.target);
+  const entitlement = resolveEntitlement(req);
+
+  if (!file) {
+    return res.status(400).json({ error: "No file uploaded." });
+  }
 
   if (!target) {
-    cleanupFiles(inputPath);
+    cleanupFiles(file.path);
     return res.status(400).json({ error: "Target format is required." });
   }
 
   if (!isSupportedTarget(target)) {
-    cleanupFiles(inputPath);
+    cleanupFiles(file.path);
     return res.status(400).json({ error: "Unsupported target format." });
   }
 
+  const originalName = file.originalname || "";
+  const inputExt = detectInputExt(originalName);
+  const inputPath = file.path;
+  const outputPath = `${inputPath}.${target}`;
+  const downloadName = buildOutputName(originalName, target);
+
   if (inputExt && inputExt === target) {
     cleanupFiles(inputPath);
-    return res
-      .status(400)
-      .json({ error: "Input and output formats are the same." });
+    return res.status(400).json({
+      error: "Input and output formats are the same.",
+    });
   }
 
   const rawOptions = parseConversionOptions(req.body, target);
@@ -1429,18 +1695,16 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     return res.status(400).json({ error: optionError });
   }
 
-  console.log("Starting conversion:", {
+  console.log("Conversion request:", {
     tier: entitlement.tier,
     entitlementSource: entitlement.source,
     from: inputExt || "unknown",
     to: target,
     file: originalName,
-    sizeMB: Number((req.file.size / (1024 * 1024)).toFixed(2)),
+    sizeMB: Number((file.size / (1024 * 1024)).toFixed(2)),
     trimEnabled: options.trimEnabled,
     trimStart: options.trimStart,
     trimEnd: options.trimEnd,
-    trimStartSeconds: options.trimStartSeconds,
-    trimEndSeconds: options.trimEndSeconds,
     audioBitrate: options.audioBitrate,
     audioSampleRate: options.audioSampleRate,
     audioChannels: options.audioChannels,
@@ -1448,107 +1712,91 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     videoCodec: options.videoCodec,
     videoQuality: options.videoQuality,
     videoFps: options.videoFps,
+    muteAudio: options.muteAudio,
     imageWidth: options.imageWidth,
     imageHeight: options.imageHeight,
     imageQuality: options.imageQuality,
     iconSize: options.iconSize,
     iconBitDepth: options.iconBitDepth,
-    muteAudio: options.muteAudio,
   });
 
   try {
     await runFfmpegConversion(inputPath, target, outputPath, options);
 
-    const mimeType = MIME_MAP[target] || "application/octet-stream";
-    const stats = fs.statSync(outputPath);
+    const durationMs = Date.now() - startedAt;
+    console.log("Conversion success:", {
+      tier: entitlement.tier,
+      entitlementSource: entitlement.source,
+      from: inputExt || "unknown",
+      to: target,
+      file: originalName,
+      sizeMB: Number((file.size / (1024 * 1024)).toFixed(2)),
+      durationMs,
+      durationSec: Number((durationMs / 1000).toFixed(2)),
+    });
 
-    res.setHeader("Content-Type", mimeType);
+    res.setHeader(
+      "Content-Type",
+      MIME_MAP[target] || "application/octet-stream"
+    );
     res.setHeader(
       "Content-Disposition",
       `attachment; filename="${downloadName}"`
     );
-    res.setHeader("Content-Length", String(stats.size));
 
-    const stream = fs.createReadStream(outputPath);
-
-    stream.on("error", (streamErr) => {
-      console.error("Stream error:", streamErr);
+    res.download(outputPath, downloadName, (err) => {
       cleanupFiles(inputPath, outputPath);
 
-      if (!res.headersSent) {
-        return res.status(500).json({ error: "File streaming failed." });
+      if (err) {
+        console.error("Download callback error:", err);
       }
-
-      try {
-        res.end();
-      } catch (_) {}
     });
-
-    res.on("finish", () => {
-      const durationMs = Date.now() - startedAt;
-      console.log("Conversion finished:", {
-        tier: entitlement.tier,
-        entitlementSource: entitlement.source,
-        from: inputExt || "unknown",
-        to: target,
-        file: originalName,
-        durationMs,
-        durationSec: Number((durationMs / 1000).toFixed(2)),
-      });
-      cleanupFiles(inputPath, outputPath);
-    });
-
-    res.on("close", () => {
-      cleanupFiles(inputPath, outputPath);
-    });
-
-    stream.pipe(res);
   } catch (error) {
-    console.error("Conversion failed:", error);
     cleanupFiles(inputPath, outputPath);
+
+    console.error("Conversion failed:", {
+      tier: entitlement.tier,
+      from: inputExt || "unknown",
+      to: target,
+      file: originalName,
+      error: error.message,
+    });
 
     return res.status(500).json({
       error: error.message || "Conversion failed.",
-      ...(error.details ? { details: error.details } : {}),
     });
   }
 });
 
-// Free: max 5 dosya, Pro: max 25 dosya
-const FREE_BATCH_LIMIT = 5;
-
-app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
+// ─── /convert/batch (YENİ PATH — frontend POST ${API_URL}/convert/batch) ─────
+// Eski /batch-convert path'i de alias olarak korunuyor (geriye dönük uyumluluk)
+async function handleBatchConvert(req, res) {
   const startedAt = Date.now();
-
-  const userId = getFirstHeaderValue(req.headers["x-user-id"]);
-  const serverTier = getUserTier(userId);
+  const files = Array.isArray(req.files) ? req.files : [];
+  const target = normalizeTarget(req.body.target);
   const entitlement = resolveEntitlement(req);
 
-  console.log("BATCH USER ID:", userId || "missing");
-  console.log("BATCH SERVER TIER:", serverTier);
-  console.log("BATCH EFFECTIVE TIER:", entitlement.tier, `(${entitlement.source})`);
-
-  const files = Array.isArray(req.files) ? req.files : [];
-  const target = normalizeTarget(req.body?.target);
+  // Frontend: FREE_BATCH_DAILY_LIMIT = 5, sunucu da aynı sınırı uygular
+  const FREE_BATCH_LIMIT = 5;
 
   if (!files.length) {
-    return res.status(400).json({ error: "At least one file is required." });
+    return res.status(400).json({ error: "No files uploaded." });
   }
 
   if (!entitlement.isPro && files.length > FREE_BATCH_LIMIT) {
-    cleanupFiles(...files.map((file) => file.path));
+    cleanupFiles(...files.map((f) => f.path));
     return res.status(403).json({
       error: `Free plan supports up to ${FREE_BATCH_LIMIT} files per batch. Upgrade to Pro for unlimited batch conversion.`,
     });
   }
 
   if (!target) {
-    cleanupFiles(...files.map((file) => file.path));
+    cleanupFiles(...files.map((f) => f.path));
     return res.status(400).json({ error: "Target format is required." });
   }
 
   if (!isSupportedTarget(target)) {
-    cleanupFiles(...files.map((file) => file.path));
+    cleanupFiles(...files.map((f) => f.path));
     return res.status(400).json({ error: "Unsupported target format." });
   }
 
@@ -1557,7 +1805,7 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
   const optionError = validateOptions(options, target, entitlement);
 
   if (optionError) {
-    cleanupFiles(...files.map((file) => file.path));
+    cleanupFiles(...files.map((f) => f.path));
     return res.status(400).json({ error: optionError });
   }
 
@@ -1583,12 +1831,10 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
     try {
       console.log("Starting batch item:", {
         tier: entitlement.tier,
-        entitlementSource: entitlement.source,
         from: inputExt || "unknown",
         to: target,
         file: originalName,
         sizeMB: Number((file.size / (1024 * 1024)).toFixed(2)),
-        videoFps: options.videoFps,
       });
 
       await runFfmpegConversion(inputPath, target, outputPath, options);
@@ -1610,7 +1856,7 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
   }
 
   if (!convertedEntries.length) {
-    cleanupFiles(...files.map((file) => file.path));
+    cleanupFiles(...files.map((f) => f.path));
     return res.status(500).json({
       error: "All batch conversions failed.",
       failed: failedEntries,
@@ -1629,15 +1875,13 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
   archive.on("error", (error) => {
     console.error("ZIP creation failed:", error);
     cleanupFiles(
-      ...convertedEntries.flatMap((entry) => [entry.inputPath, entry.outputPath])
+      ...convertedEntries.flatMap((e) => [e.inputPath, e.outputPath])
     );
 
     if (!res.headersSent) {
       res.status(500).json({ error: "ZIP creation failed." });
     } else {
-      try {
-        res.end();
-      } catch (_) {}
+      try { res.end(); } catch (_) {}
     }
   });
 
@@ -1645,23 +1889,21 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
     const durationMs = Date.now() - startedAt;
     console.log("Batch conversion finished:", {
       tier: entitlement.tier,
-      entitlementSource: entitlement.source,
       target,
       successCount: convertedEntries.length,
       failedCount: failedEntries.length,
       durationMs,
       durationSec: Number((durationMs / 1000).toFixed(2)),
-      failedEntries,
     });
 
     cleanupFiles(
-      ...convertedEntries.flatMap((entry) => [entry.inputPath, entry.outputPath])
+      ...convertedEntries.flatMap((e) => [e.inputPath, e.outputPath])
     );
   });
 
   res.on("close", () => {
     cleanupFiles(
-      ...convertedEntries.flatMap((entry) => [entry.inputPath, entry.outputPath])
+      ...convertedEntries.flatMap((e) => [e.inputPath, e.outputPath])
     );
   });
 
@@ -1678,15 +1920,22 @@ app.post("/convert/batch", upload.array("files", 25), async (req, res) => {
   }
 
   await archive.finalize();
-});
+}
 
+// Frontend'in kullandığı path: POST /convert/batch
+app.post("/convert/batch", upload.array("files", 25), handleBatchConvert);
+
+// Geriye dönük uyumluluk için eski path de çalışır
+app.post("/batch-convert", upload.array("files", 25), handleBatchConvert);
+
+// ─── Global error handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   if (req?.file?.path) {
     cleanupFiles(req.file.path);
   }
 
   if (Array.isArray(req?.files)) {
-    cleanupFiles(...req.files.map((file) => file.path));
+    cleanupFiles(...req.files.map((f) => f.path));
   }
 
   if (err instanceof multer.MulterError) {
@@ -1697,10 +1946,16 @@ app.use((err, req, res, next) => {
     return res.status(400).json({ error: err.message });
   }
 
-  console.error("Unexpected server error:", err);
-  return res.status(500).json({ error: "Unexpected server error." });
+  if (err) {
+    console.error("Unhandled error:", err);
+  }
+
+  return res.status(500).json({
+    error: "Unexpected server error.",
+  });
 });
 
 app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
+  console.log(`Converto server running on port ${PORT}`);
+  console.log(`FFmpeg path: ${ffmpegInstaller.path}`);
 });
