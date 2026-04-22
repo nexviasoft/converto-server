@@ -3,6 +3,7 @@ const multer = require("multer");
 const cors = require("cors");
 const fs = require("fs");
 const path = require("path");
+const os = require("os");
 const { spawn } = require("child_process");
 const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const archiver = require("archiver");
@@ -73,7 +74,6 @@ const IMAGE_FORMATS = new Set([
   "avif",
 ]);
 
-// Frontend'deki PDF_TO_IMAGE_TARGETS ile eşleşen set
 const PDF_TO_IMAGE_FORMATS = new Set(["png", "jpg", "webp"]);
 
 const MIME_MAP = {
@@ -1402,58 +1402,169 @@ function runFfmpegConversion(inputPath, target, outputPath, options) {
   });
 }
 
-// ─── PDF sayfasını FFmpeg ile image'a dönüştür ───────────────────────────────
-// mutool (mupdf-tools) ile PDF sayfasını raster PNG'ye çevirir,
-// ardından isteğe göre JPG/WEBP'e dönüştürür.
-function renderPdfPageWithFfmpeg(inputPath, pageIndex, outputPath, targetFmt) {
+function runBinary(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    // FFmpeg'in PDF decoder'ı (libgs / Ghostscript) gerektirir.
-    // Render için sayfa seçimi: -page_index flag'i ile.
-    const args = [
-      "-y",
-      "-hide_banner",
-      "-loglevel",
-      "error",
-      "-i",
-      inputPath,
-      "-vf",
-      `select=eq(n\\,${pageIndex})`,
-      "-frames:v",
-      "1",
-    ];
+    const child = spawn(command, args, options);
+    let stderr = "";
+    let stdout = "";
 
-    if (targetFmt === "jpg") {
-      args.push("-q:v", "3");
-    } else if (targetFmt === "webp") {
-      args.push("-quality", "92");
+    if (child.stderr) {
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+      });
     }
 
-    args.push(outputPath);
+    if (child.stdout) {
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk.toString();
+      });
+    }
 
-    const ffmpeg = spawn(ffmpegInstaller.path, args);
-    let stderr = "";
+    child.on("error", reject);
 
-    ffmpeg.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    ffmpeg.on("error", reject);
-    ffmpeg.on("close", (code) => {
+    child.on("close", (code) => {
       if (code === 0) {
-        resolve();
+        resolve({ stdout, stderr });
       } else {
-        reject(new Error(stderr || `FFmpeg exited with code ${code}`));
+        reject(new Error(stderr || stdout || `${command} exited with code ${code}`));
       }
     });
   });
+}
+
+function makeTempDir(prefix = "converto-") {
+  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+}
+
+async function writeSinglePagePdf(sourcePdfDoc, pageIndex, outputPdfPath) {
+  const singlePdf = await PDFDocument.create();
+  const [copiedPage] = await singlePdf.copyPages(sourcePdfDoc, [pageIndex]);
+  singlePdf.addPage(copiedPage);
+  const bytes = await singlePdf.save();
+  fs.writeFileSync(outputPdfPath, bytes);
+}
+
+async function tryRenderWithPdftoppm(singlePagePdfPath, outputBaseNoExt) {
+  await runBinary("pdftoppm", [
+    "-png",
+    "-singlefile",
+    "-r",
+    "180",
+    singlePagePdfPath,
+    outputBaseNoExt,
+  ]);
+
+  const outputPath = `${outputBaseNoExt}.png`;
+  if (!fs.existsSync(outputPath)) {
+    throw new Error("pdftoppm did not produce an output file.");
+  }
+
+  return outputPath;
+}
+
+async function tryRenderWithPdftocairo(singlePagePdfPath, outputBaseNoExt) {
+  await runBinary("pdftocairo", [
+    "-png",
+    "-singlefile",
+    "-r",
+    "180",
+    singlePagePdfPath,
+    outputBaseNoExt,
+  ]);
+
+  const outputPath = `${outputBaseNoExt}.png`;
+  if (!fs.existsSync(outputPath)) {
+    throw new Error("pdftocairo did not produce an output file.");
+  }
+
+  return outputPath;
+}
+
+async function tryRenderWithFfmpeg(singlePagePdfPath, outputPngPath) {
+  await runBinary(ffmpegInstaller.path, [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    singlePagePdfPath,
+    "-frames:v",
+    "1",
+    outputPngPath,
+  ]);
+
+  if (!fs.existsSync(outputPngPath)) {
+    throw new Error("FFmpeg did not produce an output file.");
+  }
+
+  return outputPngPath;
+}
+
+async function convertPngToTarget(inputPngPath, outputPath, targetFmt) {
+  if (targetFmt === "png") {
+    fs.copyFileSync(inputPngPath, outputPath);
+    return;
+  }
+
+  const args = [
+    "-y",
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    inputPngPath,
+  ];
+
+  if (targetFmt === "jpg") {
+    args.push("-q:v", "2");
+  } else if (targetFmt === "webp") {
+    args.push("-quality", "92");
+  }
+
+  args.push(outputPath);
+
+  await runBinary(ffmpegInstaller.path, args);
+
+  if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+    throw new Error(`Could not convert PNG page to ${targetFmt.toUpperCase()}.`);
+  }
+}
+
+async function renderSinglePdfPageToTarget(singlePagePdfPath, outputPath, targetFmt, tempDir) {
+  const renderBase = path.join(tempDir, `render_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  const tempPngPath = `${renderBase}.png`;
+
+  let renderedPngPath = null;
+  let lastError = null;
+
+  const strategies = [
+    () => tryRenderWithPdftoppm(singlePagePdfPath, renderBase),
+    () => tryRenderWithPdftocairo(singlePagePdfPath, renderBase),
+    () => tryRenderWithFfmpeg(singlePagePdfPath, tempPngPath),
+  ];
+
+  for (const strategy of strategies) {
+    try {
+      renderedPngPath = await strategy();
+      break;
+    } catch (error) {
+      lastError = error;
+    }
+  }
+
+  if (!renderedPngPath) {
+    throw new Error(
+      lastError?.message || "No available PDF page rendering strategy succeeded."
+    );
+  }
+
+  await convertPngToTarget(renderedPngPath, outputPath, targetFmt);
 }
 
 function createBatchZipName(target) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   return `converto_batch_${target}_${stamp}.zip`;
 }
-
-// ─── Routes ──────────────────────────────────────────────────────────────────
 
 app.get("/", (_req, res) => {
   res.json({
@@ -1477,7 +1588,6 @@ app.get("/health", (_req, res) => {
   });
 });
 
-// ─── /pdf/split (mevcut, korundu) ────────────────────────────────────────────
 app.post("/pdf/split", upload.single("file"), async (req, res) => {
   const file = req.file;
   const range = String(req.body?.range || "").trim();
@@ -1523,11 +1633,6 @@ app.post("/pdf/split", upload.single("file"), async (req, res) => {
   }
 });
 
-// ─── /pdf/to-images (YENİ — frontend'deki /pdf/to-images endpoint'i) ─────────
-// Frontend: POST ${API_URL}/pdf/to-images
-// FormData: file (PDF), target (png | jpg | webp)
-// Yanıt: Tek sayfalıysa doğrudan image dosyası,
-//         çok sayfalıysa ZIP (her sayfa ayrı dosya)
 app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
   const file = req.file;
   const rawTarget = normalizeTarget(req.body?.target || "png");
@@ -1552,14 +1657,14 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
       .json({ error: "Supported output formats: png, jpg, webp." });
   }
 
-  const target = rawTarget; // "png" | "jpg" | "webp"
+  const target = rawTarget;
   const outputFiles = [];
+  const tempArtifacts = [];
 
   try {
-    // pdf-lib ile sayfa sayısını al
     const pdfBytes = fs.readFileSync(file.path);
-    const pdfDoc = await PDFDocument.load(pdfBytes);
-    const pageCount = pdfDoc.getPageCount();
+    const sourcePdf = await PDFDocument.load(pdfBytes);
+    const pageCount = sourcePdf.getPageCount();
 
     if (pageCount === 0) {
       cleanupFiles(file.path);
@@ -1567,17 +1672,24 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
     }
 
     const baseName = path.parse(file.originalname || "document").name;
+    const jobTempDir = makeTempDir("converto-pdf-pages-");
     const stamp = Date.now();
 
-    // Her sayfa için FFmpeg ile render et
-    for (let i = 0; i < pageCount; i++) {
+    tempArtifacts.push(jobTempDir);
+
+    for (let i = 0; i < pageCount; i += 1) {
+      const singlePagePdfPath = path.join(jobTempDir, `page_${i + 1}.pdf`);
       const outputName = `pdf_page_${stamp}_${i + 1}.${target}`;
       const outputPath = path.join(uploadDir, outputName);
 
-      await renderPdfPageWithFfmpeg(file.path, i, outputPath, target);
+      await writeSinglePagePdf(sourcePdf, i, singlePagePdfPath);
+      await renderSinglePdfPageToTarget(singlePagePdfPath, outputPath, target, jobTempDir);
 
       if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-        outputFiles.push({ path: outputPath, name: `${baseName}-page-${i + 1}.${target}` });
+        outputFiles.push({
+          path: outputPath,
+          name: `${baseName}-page-${i + 1}.${target}`,
+        });
       }
     }
 
@@ -1586,7 +1698,6 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
       return res.status(500).json({ error: "No pages could be rendered." });
     }
 
-    // Tek sayfa → doğrudan image döndür
     if (outputFiles.length === 1) {
       const single = outputFiles[0];
       const mime = MIME_MAP[target] || "application/octet-stream";
@@ -1599,12 +1710,14 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
 
       res.download(single.path, single.name, () => {
         cleanupFiles(file.path, single.path);
+        for (const dir of tempArtifacts) {
+          fs.rm(dir, { recursive: true, force: true }, () => {});
+        }
       });
 
       return;
     }
 
-    // Çok sayfa → ZIP
     const zipName = `${baseName}-${target}-pages.zip`;
 
     res.setHeader("Content-Type", "application/zip");
@@ -1618,19 +1731,31 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
     archive.on("error", (err) => {
       console.error("PDF to image ZIP error:", err);
       cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+      for (const dir of tempArtifacts) {
+        fs.rm(dir, { recursive: true, force: true }, () => {});
+      }
+
       if (!res.headersSent) {
         res.status(500).json({ error: "ZIP creation failed." });
       } else {
-        try { res.end(); } catch (_) {}
+        try {
+          res.end();
+        } catch (_) {}
       }
     });
 
     res.on("finish", () => {
       cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+      for (const dir of tempArtifacts) {
+        fs.rm(dir, { recursive: true, force: true }, () => {});
+      }
     });
 
     res.on("close", () => {
       cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+      for (const dir of tempArtifacts) {
+        fs.rm(dir, { recursive: true, force: true }, () => {});
+      }
     });
 
     archive.pipe(res);
@@ -1643,6 +1768,9 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
   } catch (error) {
     console.error("PDF to image error:", error);
     cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
+    for (const dir of tempArtifacts) {
+      fs.rm(dir, { recursive: true, force: true }, () => {});
+    }
 
     if (!res.headersSent) {
       return res.status(500).json({
@@ -1652,7 +1780,6 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
   }
 });
 
-// ─── /convert (mevcut, korundu) ──────────────────────────────────────────────
 app.post("/convert", upload.single("file"), async (req, res) => {
   const startedAt = Date.now();
   const file = req.file;
@@ -1768,15 +1895,12 @@ app.post("/convert", upload.single("file"), async (req, res) => {
   }
 });
 
-// ─── /convert/batch (YENİ PATH — frontend POST ${API_URL}/convert/batch) ─────
-// Eski /batch-convert path'i de alias olarak korunuyor (geriye dönük uyumluluk)
 async function handleBatchConvert(req, res) {
   const startedAt = Date.now();
   const files = Array.isArray(req.files) ? req.files : [];
   const target = normalizeTarget(req.body.target);
   const entitlement = resolveEntitlement(req);
 
-  // Frontend: FREE_BATCH_DAILY_LIMIT = 5, sunucu da aynı sınırı uygular
   const FREE_BATCH_LIMIT = 5;
 
   if (!files.length) {
@@ -1881,7 +2005,9 @@ async function handleBatchConvert(req, res) {
     if (!res.headersSent) {
       res.status(500).json({ error: "ZIP creation failed." });
     } else {
-      try { res.end(); } catch (_) {}
+      try {
+        res.end();
+      } catch (_) {}
     }
   });
 
@@ -1922,13 +2048,9 @@ async function handleBatchConvert(req, res) {
   await archive.finalize();
 }
 
-// Frontend'in kullandığı path: POST /convert/batch
 app.post("/convert/batch", upload.array("files", 25), handleBatchConvert);
-
-// Geriye dönük uyumluluk için eski path de çalışır
 app.post("/batch-convert", upload.array("files", 25), handleBatchConvert);
 
-// ─── Global error handler ─────────────────────────────────────────────────────
 app.use((err, req, res, next) => {
   if (req?.file?.path) {
     cleanupFiles(req.file.path);
