@@ -75,6 +75,9 @@ const IMAGE_FORMATS = new Set([
 ]);
 
 const PDF_TO_IMAGE_FORMATS = new Set(["png", "jpg", "webp"]);
+const PDF_INPUT_FORMATS = new Set(["pdf"]);
+const TO_PDF_IMAGE_INPUT_FORMATS = new Set(["png", "jpg"]);
+const PDF_BETA_FILE_LIMIT = 5;
 
 const MIME_MAP = {
   mp3: "audio/mpeg",
@@ -135,6 +138,13 @@ function safeUnlink(filePath) {
 function cleanupFiles(...paths) {
   for (const p of paths) {
     safeUnlink(p);
+  }
+}
+
+function cleanupDirectories(...dirs) {
+  for (const dir of dirs) {
+    if (!dir) continue;
+    fs.rm(dir, { recursive: true, force: true }, () => {});
   }
 }
 
@@ -1531,7 +1541,10 @@ async function convertPngToTarget(inputPngPath, outputPath, targetFmt) {
 }
 
 async function renderSinglePdfPageToTarget(singlePagePdfPath, outputPath, targetFmt, tempDir) {
-  const renderBase = path.join(tempDir, `render_${Date.now()}_${Math.random().toString(36).slice(2)}`);
+  const renderBase = path.join(
+    tempDir,
+    `render_${Date.now()}_${Math.random().toString(36).slice(2)}`
+  );
   const tempPngPath = `${renderBase}.png`;
 
   let renderedPngPath = null;
@@ -1566,6 +1579,193 @@ function createBatchZipName(target) {
   return `converto_batch_${target}_${stamp}.zip`;
 }
 
+function isPdfFile(file) {
+  if (!file) return false;
+  return (
+    file.mimetype === "application/pdf" ||
+    (file.originalname || "").toLowerCase().endsWith(".pdf")
+  );
+}
+
+function isImageFileForPdf(file) {
+  if (!file) return false;
+  const ext = detectInputExt(file.originalname || "");
+  return TO_PDF_IMAGE_INPUT_FORMATS.has(ext);
+}
+
+function buildPdfDownloadName(base = "document") {
+  const safeBase = path.parse(base).name || "document";
+  return `${safeBase}.pdf`;
+}
+
+function getImageDimsFromBytes(bytes) {
+  const header = bytes.subarray(0, 32);
+
+  if (
+    header[0] === 0x89 &&
+    header[1] === 0x50 &&
+    header[2] === 0x4e &&
+    header[3] === 0x47
+  ) {
+    return {
+      type: "png",
+      width:
+        (bytes[16] << 24) |
+        (bytes[17] << 16) |
+        (bytes[18] << 8) |
+        bytes[19],
+      height:
+        (bytes[20] << 24) |
+        (bytes[21] << 16) |
+        (bytes[22] << 8) |
+        bytes[23],
+    };
+  }
+
+  if (header[0] === 0xff && header[1] === 0xd8) {
+    return { type: "jpg" };
+  }
+
+  return { type: "unknown" };
+}
+
+async function addImageAsPdfPage(pdfDoc, filePath, originalName = "image") {
+  const bytes = fs.readFileSync(filePath);
+  const uint8 = new Uint8Array(bytes);
+  const info = getImageDimsFromBytes(uint8);
+
+  let embeddedImage;
+  let width = 595.28;
+  let height = 841.89;
+
+  if (info.type === "png") {
+    embeddedImage = await pdfDoc.embedPng(uint8);
+    width = embeddedImage.width;
+    height = embeddedImage.height;
+  } else if (info.type === "jpg") {
+    embeddedImage = await pdfDoc.embedJpg(uint8);
+    width = embeddedImage.width;
+    height = embeddedImage.height;
+  } else {
+    throw new Error(
+      `${originalName} is not a supported image for direct PDF embedding. Use PNG or JPG/JPEG for now.`
+    );
+  }
+
+  const isLandscape = width > height;
+  const pageWidth = isLandscape ? 841.89 : 595.28;
+  const pageHeight = isLandscape ? 595.28 : 841.89;
+  const margin = 24;
+
+  const scale = Math.min(
+    (pageWidth - margin * 2) / width,
+    (pageHeight - margin * 2) / height
+  );
+
+  const drawWidth = width * scale;
+  const drawHeight = height * scale;
+  const x = (pageWidth - drawWidth) / 2;
+  const y = (pageHeight - drawHeight) / 2;
+
+  const page = pdfDoc.addPage([pageWidth, pageHeight]);
+  page.drawImage(embeddedImage, {
+    x,
+    y,
+    width: drawWidth,
+    height: drawHeight,
+  });
+}
+
+async function copyAllPagesFromPdf(targetPdf, sourcePdfBytes) {
+  const sourcePdf = await PDFDocument.load(sourcePdfBytes);
+  const pageIndices = sourcePdf.getPageIndices();
+  const copiedPages = await targetPdf.copyPages(sourcePdf, pageIndices);
+
+  for (const page of copiedPages) {
+    targetPdf.addPage(page);
+  }
+}
+
+async function convertSingleImageToPdf(file, outputPath) {
+  const pdfDoc = await PDFDocument.create();
+  await addImageAsPdfPage(pdfDoc, file.path, file.originalname);
+  const pdfBytes = await pdfDoc.save();
+  fs.writeFileSync(outputPath, pdfBytes);
+}
+
+async function convertImagesToPdf(files, outputPath) {
+  const pdfDoc = await PDFDocument.create();
+
+  for (const file of files) {
+    if (!isImageFileForPdf(file)) {
+      throw new Error(
+        `${file.originalname} is not supported for image-to-PDF during beta. Please use PNG or JPG/JPEG.`
+      );
+    }
+
+    const ext = detectInputExt(file.originalname || "");
+    if (!["png", "jpg"].includes(ext)) {
+      throw new Error(
+        `${file.originalname} is not supported for image-to-PDF during beta. Please use PNG or JPG/JPEG.`
+      );
+    }
+
+    await addImageAsPdfPage(pdfDoc, file.path, file.originalname);
+  }
+
+  const pdfBytes = await pdfDoc.save();
+  fs.writeFileSync(outputPath, pdfBytes);
+}
+
+async function mergePdfFiles(files, outputPath) {
+  const mergedPdf = await PDFDocument.create();
+
+  for (const file of files) {
+    if (!isPdfFile(file)) {
+      throw new Error(`${file.originalname} is not a PDF file.`);
+    }
+
+    const pdfBytes = fs.readFileSync(file.path);
+    await copyAllPagesFromPdf(mergedPdf, pdfBytes);
+  }
+
+  const mergedBytes = await mergedPdf.save();
+  fs.writeFileSync(outputPath, mergedBytes);
+}
+
+async function mergeMixedFilesToPdf(files, outputPath) {
+  const mergedPdf = await PDFDocument.create();
+
+  for (const file of files) {
+    if (isPdfFile(file)) {
+      const pdfBytes = fs.readFileSync(file.path);
+      await copyAllPagesFromPdf(mergedPdf, pdfBytes);
+      continue;
+    }
+
+    if (isImageFileForPdf(file)) {
+      const ext = detectInputExt(file.originalname || "");
+      if (!["png", "jpg"].includes(ext)) {
+        throw new Error(
+          `${file.originalname} is not supported in mixed PDF merge during beta. Please use PDF, PNG, or JPG/JPEG.`
+        );
+      }
+
+      await addImageAsPdfPage(mergedPdf, file.path, file.originalname);
+      continue;
+    }
+
+    throw new Error(`${file.originalname} is not supported for mixed PDF merge.`);
+  }
+
+  if (mergedPdf.getPageCount() === 0) {
+    throw new Error("No valid files were added to the output PDF.");
+  }
+
+  const mergedBytes = await mergedPdf.save();
+  fs.writeFileSync(outputPath, mergedBytes);
+}
+
 app.get("/", (_req, res) => {
   res.json({
     ok: true,
@@ -1585,6 +1785,17 @@ app.get("/health", (_req, res) => {
       ...Array.from(VIDEO_FORMATS),
       ...Array.from(IMAGE_FORMATS),
     ],
+    pdfTools: {
+      beta: true,
+      free: true,
+      maxFilesPerPdfFlow: PDF_BETA_FILE_LIMIT,
+      imageToPdfAcceptedFormats: ["png", "jpg", "jpeg"],
+      split: true,
+      toImages: true,
+      mergePdf: true,
+      mergeMixed: true,
+      imageToPdf: true,
+    },
   });
 });
 
@@ -1710,9 +1921,7 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
 
       res.download(single.path, single.name, () => {
         cleanupFiles(file.path, single.path);
-        for (const dir of tempArtifacts) {
-          fs.rm(dir, { recursive: true, force: true }, () => {});
-        }
+        cleanupDirectories(...tempArtifacts);
       });
 
       return;
@@ -1731,9 +1940,7 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
     archive.on("error", (err) => {
       console.error("PDF to image ZIP error:", err);
       cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
-      for (const dir of tempArtifacts) {
-        fs.rm(dir, { recursive: true, force: true }, () => {});
-      }
+      cleanupDirectories(...tempArtifacts);
 
       if (!res.headersSent) {
         res.status(500).json({ error: "ZIP creation failed." });
@@ -1746,16 +1953,12 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
 
     res.on("finish", () => {
       cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
-      for (const dir of tempArtifacts) {
-        fs.rm(dir, { recursive: true, force: true }, () => {});
-      }
+      cleanupDirectories(...tempArtifacts);
     });
 
     res.on("close", () => {
       cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
-      for (const dir of tempArtifacts) {
-        fs.rm(dir, { recursive: true, force: true }, () => {});
-      }
+      cleanupDirectories(...tempArtifacts);
     });
 
     archive.pipe(res);
@@ -1768,15 +1971,106 @@ app.post("/pdf/to-images", upload.single("file"), async (req, res) => {
   } catch (error) {
     console.error("PDF to image error:", error);
     cleanupFiles(file.path, ...outputFiles.map((f) => f.path));
-    for (const dir of tempArtifacts) {
-      fs.rm(dir, { recursive: true, force: true }, () => {});
-    }
+    cleanupDirectories(...tempArtifacts);
 
     if (!res.headersSent) {
       return res.status(500).json({
         error: error?.message || "PDF to image conversion failed.",
       });
     }
+  }
+});
+
+app.post("/pdf/from-images", upload.array("files", PDF_BETA_FILE_LIMIT), async (req, res) => {
+  const files = Array.isArray(req.files) ? req.files : [];
+
+  if (!files.length) {
+    return res.status(400).json({ error: "At least one PNG or JPG/JPEG image is required." });
+  }
+
+  const unsupported = files.find((file) => !isImageFileForPdf(file));
+  if (unsupported) {
+    cleanupFiles(...files.map((f) => f.path));
+    return res.status(400).json({
+      error: `${unsupported.originalname} is not supported for image-to-PDF during beta. Please use PNG or JPG/JPEG.`,
+    });
+  }
+
+  try {
+    const outputPath = path.join(uploadDir, `images_to_pdf_${Date.now()}.pdf`);
+    await convertImagesToPdf(files, outputPath);
+
+    const downloadName = "images-to-pdf.pdf";
+
+    res.download(outputPath, downloadName, () => {
+      cleanupFiles(...files.map((f) => f.path), outputPath);
+    });
+  } catch (error) {
+    console.error("Images to PDF error:", error);
+    cleanupFiles(...files.map((f) => f.path));
+    return res.status(400).json({
+      error: error?.message || "Images to PDF failed.",
+    });
+  }
+});
+
+app.post("/pdf/merge", upload.array("files", PDF_BETA_FILE_LIMIT), async (req, res) => {
+  const files = Array.isArray(req.files) ? req.files : [];
+
+  if (!files.length) {
+    return res.status(400).json({ error: "At least one PDF file is required." });
+  }
+
+  try {
+    const outputPath = path.join(uploadDir, `merged_${Date.now()}.pdf`);
+    await mergePdfFiles(files, outputPath);
+
+    const downloadName = "merged-pdf.pdf";
+
+    res.download(outputPath, downloadName, () => {
+      cleanupFiles(...files.map((f) => f.path), outputPath);
+    });
+  } catch (error) {
+    console.error("Merge PDF error:", error);
+    cleanupFiles(...files.map((f) => f.path));
+    return res.status(400).json({
+      error: error?.message || "Merge PDF failed.",
+    });
+  }
+});
+
+app.post("/pdf/merge-mixed", upload.array("files", PDF_BETA_FILE_LIMIT), async (req, res) => {
+  const files = Array.isArray(req.files) ? req.files : [];
+
+  if (!files.length) {
+    return res.status(400).json({
+      error: "At least one PDF, PNG, or JPG/JPEG file is required.",
+    });
+  }
+
+  const unsupportedMixed = files.find((file) => !isPdfFile(file) && !isImageFileForPdf(file));
+  if (unsupportedMixed) {
+    cleanupFiles(...files.map((f) => f.path));
+    return res.status(400).json({
+      error: `${unsupportedMixed.originalname} is not supported in mixed PDF merge during beta. Please use PDF, PNG, or JPG/JPEG.`,
+    });
+  }
+
+  try {
+    const outputPath = path.join(uploadDir, `mixed_merged_${Date.now()}.pdf`);
+    await mergeMixedFilesToPdf(files, outputPath);
+
+    const downloadName = "pdf-and-images-merged.pdf";
+
+    res.download(outputPath, downloadName, () => {
+      cleanupFiles(...files.map((f) => f.path), outputPath);
+    });
+  } catch (error) {
+    console.error("Merge mixed PDF error:", error);
+    cleanupFiles(...files.map((f) => f.path));
+    return res.status(400).json({
+      error: error?.message || "Mixed PDF merge failed.",
+    });
   }
 });
 
@@ -2063,6 +2357,12 @@ app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
       return res.status(400).json({ error: "File is too large. Max 1000MB." });
+    }
+
+    if (err.code === "LIMIT_UNEXPECTED_FILE") {
+      return res.status(400).json({
+        error: `Too many files for this beta workflow. Please upload up to ${PDF_BETA_FILE_LIMIT} files.`,
+      });
     }
 
     return res.status(400).json({ error: err.message });
