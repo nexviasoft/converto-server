@@ -420,7 +420,7 @@ function normalizeIconSize(value) {
   const v = String(value || "").trim();
   if (!v) return null;
 
-  const allowed = new Set(["16", "32", "48", "64", "128", "256"]);
+  const allowed = new Set(["16", "32"]);
   return allowed.has(v) ? Number(v) : null;
 }
 
@@ -428,7 +428,7 @@ function normalizeIconBitDepth(value) {
   const v = String(value || "").trim();
   if (!v) return null;
 
-  const allowed = new Set(["8", "24", "32"]);
+  const allowed = new Set(["24"]);
   return allowed.has(v) ? Number(v) : null;
 }
 
@@ -608,6 +608,11 @@ function sanitizeOptionsForTarget(options, target) {
   if (!iconSupported) {
     sanitized.iconSize = null;
     sanitized.iconBitDepth = null;
+  } else {
+    // Keep ICO usable even when an older client does not send icon options.
+    // These defaults are within the free entitlement limits.
+    sanitized.iconSize = sanitized.iconSize || 32;
+    sanitized.iconBitDepth = sanitized.iconBitDepth || 24;
   }
 
   if (!trimSupported) {
@@ -720,13 +725,6 @@ function validateOptions(options, target, entitlement = { isPro: false }) {
       return "Upgrade to Pro to use 1440p or 4K export.";
     }
 
-    if (options.iconSize && options.iconSize > 48) {
-      return "Upgrade to Pro to export large ICO sizes.";
-    }
-
-    if (options.iconBitDepth && options.iconBitDepth === 32) {
-      return "Upgrade to Pro to use 32-bit ICO export.";
-    }
   }
 
   return null;
@@ -963,22 +961,14 @@ function buildGifFilters(options) {
 }
 
 function buildIcoFilters(options) {
-  const filters = [];
+  const size = options.iconSize || 32;
 
-  const baseResize = buildScaleFilterForImageResize(
-    options.imageWidth,
-    options.imageHeight
-  );
-
-  if (baseResize) {
-    filters.push(baseResize);
-  }
-
-  if (options.iconSize) {
-    filters.push(`scale=${options.iconSize}:${options.iconSize}`);
-  }
-
-  return filters;
+  // ICO canvases are square. Preserve the source aspect ratio, then center it
+  // on a transparent square instead of stretching logos or artwork.
+  return [
+    `scale=${size}:${size}:force_original_aspect_ratio=decrease`,
+    `pad=${size}:${size}:(ow-iw)/2:(oh-ih)/2:color=0x00000000`,
+  ];
 }
 
 function buildIcoPixelFormatArgs(iconBitDepth) {
