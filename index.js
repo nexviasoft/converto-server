@@ -322,6 +322,13 @@ function normalizeAudioSampleRate(value) {
   return allowed.has(v) ? v : null;
 }
 
+const OPUS_SAMPLE_RATES = new Set(["8000", "12000", "16000", "24000", "48000"]);
+
+function getOpusSampleRate(value) {
+  const normalized = String(value || "").trim();
+  return OPUS_SAMPLE_RATES.has(normalized) ? normalized : "48000";
+}
+
 function normalizeAudioChannels(value) {
   const v = String(value || "").trim();
   if (!v) return null;
@@ -576,6 +583,13 @@ function sanitizeOptionsForTarget(options, target) {
     sanitized.videoCodec = null;
     sanitized.videoQuality = null;
     sanitized.videoFps = null;
+  }
+
+  // GIF keeps useful video-like settings such as resolution, quality, and FPS,
+  // but it must never inherit a video codec or an audio stream option.
+  if (gifTarget) {
+    sanitized.videoCodec = null;
+    sanitized.muteAudio = false;
   }
 
   if (!videoSupported) {
@@ -850,8 +864,11 @@ function buildVideoAudioArgs(
     args.push("-b:a", fallbackBitrate);
   }
 
-  if (audioSampleRate) {
-    args.push("-ar", audioSampleRate);
+  const effectiveSampleRate =
+    codec === "libopus" ? getOpusSampleRate(audioSampleRate) : audioSampleRate;
+
+  if (effectiveSampleRate) {
+    args.push("-ar", effectiveSampleRate);
   }
 
   if (audioChannels) {
@@ -898,6 +915,16 @@ function buildVideoFilters(options) {
   }
 
   return filters;
+}
+
+function buildThreeGpFilter() {
+  // H.263 only accepts a small set of exact frame sizes. Fit the source into
+  // 352x288 without stretching, then pad the remaining area.
+  return [
+    "scale=352:288:force_original_aspect_ratio=decrease",
+    "pad=352:288:(ow-iw)/2:(oh-ih)/2",
+    "setsar=1",
+  ].join(",");
 }
 
 function buildVideoFpsArgs(options) {
@@ -1034,7 +1061,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "libopus",
           ...buildAudioOutputArgs({
             audioBitrate: options.audioBitrate || "128k",
-            audioSampleRate: options.audioSampleRate,
+            audioSampleRate: getOpusSampleRate(options.audioSampleRate),
             audioChannels: options.audioChannels,
           }),
           outputPath,
@@ -1149,17 +1176,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "realtime",
           "-cpu-used",
           "5",
-          ...(options.muteAudio
-            ? ["-an"]
-            : [
-                "-c:a",
-                "libopus",
-                "-b:a",
-                options.audioBitrate || "128k",
-                "-ar",
-                options.audioSampleRate || "48000",
-                ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
-              ]),
+          ...buildVideoAudioArgs(options, "libopus", "128k"),
           outputPath,
         ];
       }
@@ -1260,13 +1277,23 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
         return [
           ...inputArgs,
           ...extraOutputArgs,
-          ...vfArgs,
-          ...fpsArgs,
+          "-vf",
+          buildThreeGpFilter(),
+          "-r",
+          "25",
           "-c:v",
           "h263",
+          "-pix_fmt",
+          "yuv420p",
+          "-q:v",
+          options.videoQuality === "high"
+            ? "4"
+            : options.videoQuality === "small"
+            ? "10"
+            : "7",
           ...(options.muteAudio
             ? ["-an"]
-            : ["-c:a", "aac", "-ar", "8000", "-ac", "1"]),
+            : ["-c:a", "aac", "-b:a", "64k", "-ar", "22050", "-ac", "1"]),
           outputPath,
         ];
 
@@ -1359,10 +1386,12 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "1",
           "-c:v",
           "libaom-av1",
-          "-still-picture",
-          "1",
           "-crf",
           getAvifQuality(options.imageQuality),
+          "-b:v",
+          "0",
+          "-pix_fmt",
+          "yuv420p",
           outputPath,
         ];
       }
@@ -1373,6 +1402,33 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   }
 
   return null;
+}
+
+function getPublicConversionError(error, target = "") {
+  const raw = String(error?.message || "");
+  const normalizedTarget = normalizeTarget(target);
+
+  if (/sample rate .*not supported/i.test(raw) || /libopus/i.test(raw)) {
+    return "The selected audio settings are not compatible with this format. Please try the conversion again with the default audio settings.";
+  }
+
+  if (/specified picture size .*not valid for the H\.263 codec/i.test(raw)) {
+    return "The source video size is not compatible with 3GP. Converto could not apply the compatibility resize preset.";
+  }
+
+  if (/unrecognized option/i.test(raw) || /option not found/i.test(raw)) {
+    return `The ${normalizedTarget.toUpperCase() || "selected"} encoder is not available in the current conversion engine.`;
+  }
+
+  if (/unknown encoder|encoder .* not found/i.test(raw)) {
+    return `The ${normalizedTarget.toUpperCase() || "selected"} encoder is not available on the conversion server.`;
+  }
+
+  if (/invalid data found|could not find codec parameters/i.test(raw)) {
+    return "The uploaded file could not be read as a valid media file. Please check the file and try again.";
+  }
+
+  return "The conversion could not be completed for this file. Please try again with the default settings or choose another output format.";
 }
 
 function runFfmpegConversion(inputPath, target, outputPath, options) {
@@ -2184,7 +2240,8 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     });
 
     return res.status(500).json({
-      error: error.message || "Conversion failed.",
+      error: getPublicConversionError(error, target),
+      code: "CONVERSION_FAILED",
     });
   }
 });
@@ -2267,7 +2324,7 @@ async function handleBatchConvert(req, res) {
       console.error("Batch item failed:", originalName, error);
       failedEntries.push({
         file: originalName,
-        reason: error.message || "Conversion failed.",
+        reason: getPublicConversionError(error, target),
       });
       cleanupFiles(inputPath, outputPath);
     }
