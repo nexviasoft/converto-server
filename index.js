@@ -9,6 +9,15 @@ const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
 const archiver = require("archiver");
 const { PDFDocument } = require("pdf-lib");
 
+let sharp = null;
+try {
+  sharp = require("sharp");
+} catch (error) {
+  console.warn(
+    "Sharp is not installed. AVIF output will stay disabled until the sharp dependency is added."
+  );
+}
+
 const app = express();
 
 const PORT = process.env.PORT || 10000;
@@ -497,6 +506,12 @@ function getAvifQuality(imageQuality) {
   if (!imageQuality) return "32";
   const mapped = Math.round(63 - ((imageQuality - 1) / 99) * 45);
   return String(Math.max(18, Math.min(63, mapped)));
+}
+
+function getSharpAvifQuality(imageQuality) {
+  const quality = Number(imageQuality);
+  if (!Number.isFinite(quality)) return 82;
+  return Math.max(1, Math.min(100, Math.round(quality)));
 }
 
 function getJpgQValue(imageQuality) {
@@ -1398,6 +1413,10 @@ function getPublicConversionError(error, target = "") {
   const raw = String(error?.message || "");
   const normalizedTarget = normalizeTarget(target);
 
+  if (/SHARP_AVIF_MISSING/i.test(raw)) {
+    return "AVIF conversion is temporarily unavailable on the server because its image encoder is missing.";
+  }
+
   if (/sample rate .*not supported/i.test(raw) || /libopus/i.test(raw)) {
     return "The selected audio settings are not compatible with this format. Please try the conversion again with the default audio settings.";
   }
@@ -1421,7 +1440,65 @@ function getPublicConversionError(error, target = "") {
   return "The conversion could not be completed for this file. Please try again with the default settings or choose another output format.";
 }
 
+async function runAvifConversion(inputPath, outputPath, options = {}) {
+  if (!sharp) {
+    throw new Error(
+      "SHARP_AVIF_MISSING: Install the sharp package to enable reliable AVIF output."
+    );
+  }
+
+  // The bundled FFmpeg build can decode the source and create PNG reliably,
+  // but its AVIF muxer/encoder support varies by deployment. We therefore
+  // extract one lossless PNG frame first and let Sharp/libvips encode AVIF.
+  const intermediatePngPath = `${outputPath}.source.png`;
+
+  try {
+    const pngArgs = buildFfmpegArgs(
+      inputPath,
+      "png",
+      intermediatePngPath,
+      options
+    );
+
+    if (!pngArgs) {
+      throw new Error("Could not prepare the source frame for AVIF conversion.");
+    }
+
+    await runBinary(ffmpegInstaller.path, [
+      "-y",
+      "-hide_banner",
+      "-loglevel",
+      "error",
+      ...pngArgs,
+    ]);
+
+    if (
+      !fs.existsSync(intermediatePngPath) ||
+      fs.statSync(intermediatePngPath).size <= 0
+    ) {
+      throw new Error("FFmpeg did not produce the intermediate PNG frame.");
+    }
+
+    await sharp(intermediatePngPath, { failOn: "error" })
+      .avif({
+        quality: getSharpAvifQuality(options.imageQuality),
+        effort: 4,
+      })
+      .toFile(outputPath);
+
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size <= 0) {
+      throw new Error("Sharp did not produce a valid AVIF file.");
+    }
+  } finally {
+    safeUnlink(intermediatePngPath);
+  }
+}
+
 function runFfmpegConversion(inputPath, target, outputPath, options) {
+  if (target === "avif") {
+    return runAvifConversion(inputPath, outputPath, options);
+  }
+
   return new Promise((resolve, reject) => {
     const ffmpegArgs = buildFfmpegArgs(inputPath, target, outputPath, options);
 
@@ -1825,6 +1902,7 @@ app.get("/health", (_req, res) => {
     ok: true,
     service: "converto-server",
     ffmpegPath: ffmpegInstaller.path,
+    avifEngine: sharp ? "sharp" : "unavailable",
     uploadDir,
     supportedTargets: [
       ...Array.from(AUDIO_FORMATS),
@@ -2427,4 +2505,5 @@ app.use((err, req, res, next) => {
 app.listen(PORT, () => {
   console.log(`Converto server running on port ${PORT}`);
   console.log(`FFmpeg path: ${ffmpegInstaller.path}`);
+  console.log(`AVIF engine: ${sharp ? "Sharp/libvips" : "unavailable"}`);
 });
