@@ -17,6 +17,7 @@ const archiver = require("archiver");
 const { PDFDocument } = require("pdf-lib");
 const { getQualityProfile, getQualityCrf, getGifFilterComplex } = require("./quality-profiles");
 const { downloadPublicMedia, getDirectLinkInfo, PublicMediaError } = require("./source-url");
+const { describeMediaLink } = require("./media-providers");
 
 let sharp = null;
 try {
@@ -2142,8 +2143,8 @@ let activeUrlConversions = 0;
 
 app.post("/links/inspect", (req, res) => {
   try {
-    const info = getDirectLinkInfo(req.body?.url);
-    return res.status(200).json({ ...info, reachableUnchecked: true, maxFileSizeMB: URL_IMPORT_MAX_MB });
+    const info = describeMediaLink(req.body?.url);
+    return res.status(200).json({ ...info, reachableUnchecked: info.supported === true, maxFileSizeMB: URL_IMPORT_MAX_MB });
   } catch (error) {
     if (error instanceof PublicMediaError) {
       return res.status(error.status).json({ error: error.message, code: error.code });
