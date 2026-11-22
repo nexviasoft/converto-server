@@ -2153,6 +2153,12 @@ app.post("/links/inspect", (req, res) => {
 });
 
 app.post("/convert/url", async (req, res) => {
+  if (process.env.CONVERTO_LINKS_ENABLED !== "true") {
+    return res.status(403).json({
+      error: "Link conversion is not available yet.",
+      code: "FEATURE_UNAVAILABLE",
+    });
+  }
   const target = normalizeTarget(req.body?.target || req.body?.format);
   if (!isSupportedTarget(target)) {
     return res.status(400).json({ error: "Unsupported target format.", code: "INVALID_TARGET" });
