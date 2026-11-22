@@ -104,7 +104,13 @@ function doRequest(url, address, timeoutMs) {
       else resolve(response);
     };
     const request = transport.get(parsed, {
-      lookup: (_name, _options, callback) => callback(null, address.address, address.family),
+      lookup: (_name, options, callback) => {
+        if (options?.all) {
+          callback(null, [{ address: address.address, family: address.family }]);
+        } else {
+          callback(null, address.address, address.family);
+        }
+      },
       timeout: timeoutMs,
       headers: {
         "User-Agent": "ConvertoMediaImporter/1.0",
