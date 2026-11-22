@@ -2141,6 +2141,57 @@ const URL_IMPORT_MAX_BYTES = URL_IMPORT_MAX_MB * 1024 * 1024;
 const URL_IMPORT_MAX_CONCURRENT = Math.max(1, Math.min(4, Number(process.env.URL_IMPORT_MAX_CONCURRENT) || 2));
 let activeUrlConversions = 0;
 
+const { inspectPlatformMedia } = require("./media-inspector");
+
+let activeMediaProbes = 0;
+
+app.post("/media/inspect", async (req, res) => {
+  if (process.env.CONVERTO_MEDIA_INSPECT_ENABLED !== "true") {
+    return res.status(403).json({
+      code: "FEATURE_UNAVAILABLE",
+      error: "Media inspection is disabled."
+    });
+  }
+
+  const expected = process.env.CONVERTO_MEDIA_INSPECT_TOKEN || "";
+  const provided = req.get("x-converto-test-key") || "";
+
+  const authorized =
+    expected.length > 0 &&
+    Buffer.byteLength(expected) === Buffer.byteLength(provided) &&
+    require("node:crypto").timingSafeEqual(
+      Buffer.from(expected),
+      Buffer.from(provided)
+    );
+
+  if (!authorized) {
+    return res.status(401).json({
+      code: "UNAUTHORIZED",
+      error: "Test authorization required."
+    });
+  }
+
+  if (activeMediaProbes >= 1) {
+    return res.status(429).json({
+      code: "BUSY",
+      error: "Another media inspection is running."
+    });
+  }
+
+  activeMediaProbes++;
+
+  try {
+    const result = await inspectPlatformMedia(req.body?.url);
+    return res.status(200).json(result);
+  } catch (error) {
+    return res.status(error.status || 500).json({
+      code: error.code || "INTERNAL_ERROR",
+      error: error.status ? error.message : "Media inspection failed."
+    });
+  } finally {
+    activeMediaProbes--;
+  }
+});
 app.post("/links/inspect", (req, res) => {
   try {
     const info = describeMediaLink(req.body?.url);
