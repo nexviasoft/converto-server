@@ -5,9 +5,18 @@ const fs = require("fs");
 const path = require("path");
 const os = require("os");
 const { spawn } = require("child_process");
-const ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+let ffmpegInstaller;
+try {
+  ffmpegInstaller = require("@ffmpeg-installer/ffmpeg");
+} catch (error) {
+  if (!process.env.FFMPEG_PATH) throw error;
+  ffmpegInstaller = { path: process.env.FFMPEG_PATH };
+}
+if (process.env.FFMPEG_PATH) ffmpegInstaller = { path: process.env.FFMPEG_PATH };
 const archiver = require("archiver");
 const { PDFDocument } = require("pdf-lib");
+const { getQualityProfile, getQualityCrf, getGifFilterComplex } = require("./quality-profiles");
+const { downloadPublicMedia, getDirectLinkInfo, PublicMediaError } = require("./source-url");
 
 let sharp = null;
 try {
@@ -127,16 +136,6 @@ function getFirstHeaderValue(value) {
     return value[0];
   }
   return value;
-}
-
-function getUserTier(userId) {
-  const normalizedUserId = String(getFirstHeaderValue(userId) || "").trim();
-
-  if (normalizedUserId === "user_3Bfa3QpE3MCJzYTIIvMkFJlFmwo") {
-    return "pro";
-  }
-
-  return "free";
 }
 
 function safeUnlink(filePath) {
@@ -391,8 +390,10 @@ function normalizeVideoQuality(value) {
 
   if (!v) return null;
 
+  const aliases = { compressed: "small", smaller: "small", low: "small", best: "high", quality: "high" };
+  const normalized = aliases[v] || v;
   const allowed = new Set(["high", "balanced", "small"]);
-  return allowed.has(v) ? v : null;
+  return allowed.has(normalized) ? normalized : null;
 }
 
 function normalizeVideoFps(value) {
@@ -465,36 +466,7 @@ function getScaleFilterForResolution(resolution) {
 }
 
 function getCrfForVideoQuality(quality, codec) {
-  if (codec === "libx265") {
-    switch (quality) {
-      case "high":
-        return "24";
-      case "small":
-        return "31";
-      default:
-        return "28";
-    }
-  }
-
-  if (codec === "libvpx" || codec === "libvpx-vp9") {
-    switch (quality) {
-      case "high":
-        return "30";
-      case "small":
-        return "40";
-      default:
-        return "36";
-    }
-  }
-
-  switch (quality) {
-    case "high":
-      return "22";
-    case "small":
-      return "30";
-    default:
-      return "26";
-  }
+  return getQualityCrf(quality, codec);
 }
 
 function getWebpQuality(imageQuality) {
@@ -541,7 +513,8 @@ function parseConversionOptions(body = {}, target = "") {
 
   const videoResolution = normalizeVideoResolution(body.videoResolution);
   const videoCodec = normalizeVideoCodec(body.videoCodec, target);
-  const videoQuality = normalizeVideoQuality(body.videoQuality);
+  const videoQuality = normalizeVideoQuality(body.videoQuality || body.qualityPreset || body.quality);
+  const qualityPreset = videoQuality || "balanced";
   const videoFps = normalizeVideoFps(body.videoFps || body.fps);
 
   const imageWidth = normalizeDimension(body.imageWidth || body.width);
@@ -565,6 +538,7 @@ function parseConversionOptions(body = {}, target = "") {
     videoResolution,
     videoCodec,
     videoQuality,
+    qualityPreset,
     videoFps,
     imageWidth,
     imageHeight,
@@ -745,63 +719,11 @@ function validateOptions(options, target, entitlement = { isPro: false }) {
   return null;
 }
 
-function getEntitlementFromRequest(req) {
-  const headerCandidates = [
-    getFirstHeaderValue(req.headers["x-user-tier"]),
-    getFirstHeaderValue(req.headers["x-plan-tier"]),
-    getFirstHeaderValue(req.headers["x-tier"]),
-    getFirstHeaderValue(req.headers["x-entitlement-tier"]),
-  ];
-
-  const bodyCandidates = [
-    req.body?.tier,
-    req.body?.userTier,
-    req.body?.planTier,
-    req.body?.entitlementTier,
-  ];
-
-  const normalizedHeader = headerCandidates
-    .map((v) => String(v || "").trim().toLowerCase())
-    .find(Boolean);
-
-  const normalizedBody = bodyCandidates
-    .map((v) => String(v || "").trim().toLowerCase())
-    .find(Boolean);
-
-  const explicitPro =
-    isTruthy(req.body?.isPro) ||
-    isTruthy(getFirstHeaderValue(req.headers["x-user-pro"])) ||
-    isTruthy(getFirstHeaderValue(req.headers["x-is-pro"]));
-
-  const tier = explicitPro
-    ? "pro"
-    : normalizedHeader === "pro" || normalizedBody === "pro"
-    ? "pro"
-    : "free";
-
-  return {
-    tier,
-    isPro: tier === "pro",
-  };
-}
-
-function resolveEntitlement(req) {
-  const requestEntitlement = getEntitlementFromRequest(req);
-  const userId = getFirstHeaderValue(req.headers["x-user-id"]);
-  const serverTier = getUserTier(userId);
-
-  if (serverTier === "pro") {
-    return {
-      tier: "pro",
-      isPro: true,
-      source: "server-user-tier",
-    };
-  }
-
-  return {
-    ...requestEntitlement,
-    source: requestEntitlement.isPro ? "request-tier" : "default-free",
-  };
+// Billing integration must verify a signed identity and purchase on the server.
+// Android/web clients cannot promote themselves via x-tier, isPro or x-user-id.
+// A server-verified entitlement provider will be integrated with real Pro billing.
+function resolveEntitlement(_req) {
+  return { tier: "free", isPro: false, source: "server-default-unverified" };
 }
 
 function buildTrimArgs(options) {
@@ -925,6 +847,12 @@ function buildVideoFilters(options) {
   const resolutionFilter = getScaleFilterForResolution(options.videoResolution);
   if (resolutionFilter) {
     filters.push(resolutionFilter);
+  } else if (options.qualityPreset === "small") {
+    // Compressed profile caps HD output without upscaling smaller sources.
+    // Explicit resolution choice always takes precedence.
+    filters.push(
+  "scale=w='min(iw,1280)':h='min(ih,720)':force_original_aspect_ratio=decrease,scale=w='trunc(iw/2)*2':h='trunc(ih/2)*2'"
+);
   }
 
   return filters;
@@ -1002,6 +930,12 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   const extraOutputArgs = [...trimArgs.outputTimingArgs];
 
   if (AUDIO_FORMATS.has(target)) {
+    // The Android preset applies to audio too, unless bitrate was explicitly set.
+    const defaultAudio = {
+      small: { mp3: "96k", aac: "96k", opus: "64k", wma: "96k", ogg: "96k" },
+      balanced: { mp3: "160k", aac: "160k", opus: "128k", wma: "160k", ogg: "160k" },
+      high: { mp3: "256k", aac: "256k", opus: "192k", wma: "192k", ogg: "224k" },
+    }[options.qualityPreset || "balanced"] || {};
     switch (target) {
       case "mp3":
         return [
@@ -1010,7 +944,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-vn",
           "-codec:a",
           "libmp3lame",
-          ...(options.audioBitrate ? ["-b:a", options.audioBitrate] : ["-q:a", "3"]),
+          "-b:a", options.audioBitrate || defaultAudio.mp3 || "160k",
           ...(options.audioSampleRate ? ["-ar", options.audioSampleRate] : []),
           ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
           outputPath,
@@ -1037,7 +971,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:a",
           "aac",
           ...buildAudioOutputArgs({
-            audioBitrate: options.audioBitrate || "160k",
+            audioBitrate: options.audioBitrate || defaultAudio.aac || "160k",
             audioSampleRate: options.audioSampleRate,
             audioChannels: options.audioChannels,
           }),
@@ -1051,7 +985,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-vn",
           "-c:a",
           "libvorbis",
-          ...(options.audioBitrate ? ["-b:a", options.audioBitrate] : ["-q:a", "4"]),
+          "-b:a", options.audioBitrate || defaultAudio.ogg || "160k",
           ...(options.audioSampleRate ? ["-ar", options.audioSampleRate] : []),
           ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
           outputPath,
@@ -1065,7 +999,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:a",
           "libopus",
           ...buildAudioOutputArgs({
-            audioBitrate: options.audioBitrate || "128k",
+            audioBitrate: options.audioBitrate || defaultAudio.opus || "128k",
             audioSampleRate: getOpusSampleRate(options.audioSampleRate),
             audioChannels: options.audioChannels,
           }),
@@ -1079,6 +1013,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-vn",
           "-c:a",
           "flac",
+          "-compression_level", options.qualityPreset === "small" ? "8" : "5",
           ...(options.audioSampleRate ? ["-ar", options.audioSampleRate] : []),
           ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
           outputPath,
@@ -1104,7 +1039,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:a",
           "wmav2",
           ...buildAudioOutputArgs({
-            audioBitrate: options.audioBitrate || "160k",
+            audioBitrate: options.audioBitrate || defaultAudio.wma || "160k",
             audioSampleRate: options.audioSampleRate,
             audioChannels: options.audioChannels,
           }),
@@ -1136,6 +1071,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
     const videoFilters = buildVideoFilters(options);
     const vfArgs = videoFilters.length ? ["-vf", videoFilters.join(",")] : [];
     const fpsArgs = buildVideoFpsArgs(options);
+    const profile = getQualityProfile(options.videoQuality);
 
     switch (target) {
       case "mp4":
@@ -1153,10 +1089,10 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:v",
           codec,
           "-preset",
-          "ultrafast",
+          profile.x264Preset,
           "-crf",
           crf,
-          ...buildVideoAudioArgs(options, "aac", "128k"),
+          ...buildVideoAudioArgs(options, "aac", profile.audioBitrate),
           ...(target === "mp4" ? ["-movflags", "+faststart"] : []),
           outputPath,
         ];
@@ -1178,10 +1114,10 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-b:v",
           "0",
           "-deadline",
-          "realtime",
+          "good",
           "-cpu-used",
-          "5",
-          ...buildVideoAudioArgs(options, "libopus", "128k"),
+          String(profile.vpxCpuUsed),
+          ...buildVideoAudioArgs(options, "libopus", profile.audioBitrate),
           outputPath,
         ];
       }
@@ -1195,17 +1131,13 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:v",
           "mpeg4",
           "-q:v",
-          options.videoQuality === "high"
-            ? "4"
-            : options.videoQuality === "small"
-            ? "10"
-            : "7",
+          String(profile.mpegQuantizer),
           ...(options.muteAudio
             ? ["-an"]
             : [
                 "-c:a",
                 "libmp3lame",
-                ...(options.audioBitrate ? ["-b:a", options.audioBitrate] : ["-q:a", "4"]),
+                "-b:a", options.audioBitrate || profile.audioBitrate,
                 ...(options.audioSampleRate ? ["-ar", options.audioSampleRate] : []),
                 ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
               ]),
@@ -1225,7 +1157,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
             : [
                 "-c:a",
                 "wmav2",
-                ...(options.audioBitrate ? ["-b:a", options.audioBitrate] : []),
+                "-b:a", options.audioBitrate || profile.audioBitrate,
                 ...(options.audioSampleRate ? ["-ar", options.audioSampleRate] : []),
                 ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
               ]),
@@ -1245,7 +1177,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
             : [
                 "-c:a",
                 "libmp3lame",
-                ...(options.audioBitrate ? ["-b:a", options.audioBitrate] : []),
+                "-b:a", options.audioBitrate || profile.audioBitrate,
                 ...(options.audioSampleRate ? ["-ar", options.audioSampleRate] : []),
                 ...(options.audioChannels ? ["-ac", options.audioChannels] : []),
               ]),
@@ -1262,11 +1194,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:v",
           "mpeg2video",
           "-q:v",
-          options.videoQuality === "high"
-            ? "4"
-            : options.videoQuality === "small"
-            ? "10"
-            : "7",
+          String(profile.mpegQuantizer),
           ...(options.muteAudio
             ? ["-an"]
             : [
@@ -1291,11 +1219,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-pix_fmt",
           "yuv420p",
           "-q:v",
-          options.videoQuality === "high"
-            ? "4"
-            : options.videoQuality === "small"
-            ? "10"
-            : "7",
+          String(profile.mpegQuantizer),
           ...(options.muteAudio
             ? ["-an"]
             : ["-c:a", "aac", "-b:a", "64k", "-ar", "22050", "-ac", "1"]),
@@ -1308,10 +1232,15 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
   }
 
   if (IMAGE_FORMATS.has(target)) {
+    const imageQuality = options.imageQuality ||
+      (options.qualityPreset === "small" ? 65 : options.qualityPreset === "high" ? 94 : 82);
     switch (target) {
       case "gif": {
-        const gifFilter = buildGifFilters(options);
-        return [...inputArgs, ...extraOutputArgs, "-vf", gifFilter, outputPath];
+        const gifFilter = getGifFilterComplex({
+          ...options,
+          getResolutionFilter: getScaleFilterForResolution,
+        });
+        return [...inputArgs, ...extraOutputArgs, "-filter_complex", gifFilter, "-map", "[out]", "-an", outputPath];
       }
 
       case "png": {
@@ -1334,7 +1263,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           ...(filters.length ? ["-vf", filters.join(",")] : []),
           "-frames:v",
           "1",
-          ...(options.imageQuality ? ["-q:v", getJpgQValue(options.imageQuality)] : []),
+          "-q:v", getJpgQValue(imageQuality),
           outputPath,
         ];
       }
@@ -1350,7 +1279,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-compression_level",
           "6",
           "-quality",
-          getWebpQuality(options.imageQuality),
+          getWebpQuality(imageQuality),
           outputPath,
         ];
       }
@@ -1392,7 +1321,7 @@ function buildFfmpegArgs(inputPath, target, outputPath, options = {}) {
           "-c:v",
           "libaom-av1",
           "-crf",
-          getAvifQuality(options.imageQuality),
+          getAvifQuality(imageQuality),
           "-b:v",
           "0",
           "-pix_fmt",
@@ -1481,7 +1410,7 @@ async function runAvifConversion(inputPath, outputPath, options = {}) {
 
     await sharp(intermediatePngPath, { failOn: "error" })
       .avif({
-        quality: getSharpAvifQuality(options.imageQuality),
+        quality: getSharpAvifQuality(options.imageQuality || (options.qualityPreset === "small" ? 45 : options.qualityPreset === "high" ? 86 : 70)),
         effort: 4,
       })
       .toFile(outputPath);
@@ -1515,6 +1444,8 @@ function runFfmpegConversion(inputPath, target, outputPath, options) {
       ...ffmpegArgs,
     ]);
 
+    const maxDurationMs = Math.max(30000, Math.min(900000, Number(process.env.CONVERT_TIMEOUT_MS) || 240000));
+    const deadline = setTimeout(() => ffmpeg.kill("SIGKILL"), maxDurationMs);
     let stderr = "";
 
     ffmpeg.stderr.on("data", (chunk) => {
@@ -1525,11 +1456,12 @@ function runFfmpegConversion(inputPath, target, outputPath, options) {
       reject(error);
     });
 
-    ffmpeg.on("close", (code) => {
+    ffmpeg.on("close", (code, signal) => {
+      clearTimeout(deadline);
       if (code === 0) {
         resolve();
       } else {
-        reject(new Error(stderr || `FFmpeg exited with code ${code}`));
+        reject(new Error(signal === "SIGKILL" ? "Conversion exceeded server time limit." : (stderr || `FFmpeg exited with code ${code}`)));
       }
     });
   });
@@ -1904,6 +1836,8 @@ app.get("/health", (_req, res) => {
     ffmpegPath: ffmpegInstaller.path,
     avifEngine: sharp ? "sharp" : "unavailable",
     uploadDir,
+    qualityProfiles: ["small", "balanced", "high"],
+    linkImport: { directPublicMediaOnly: true, platformPagesSupported: false, maxFileSizeMB: URL_IMPORT_MAX_MB },
     supportedTargets: [
       ...Array.from(AUDIO_FORMATS),
       ...Array.from(VIDEO_FORMATS),
@@ -2198,6 +2132,97 @@ app.post("/pdf/merge-mixed", upload.array("files", PDF_BETA_FILE_LIMIT), async (
   }
 });
 
+// RC3B: limited, direct-asset import. A video *page* is not a video file.
+// Instagram/X/YouTube watch links must use authorized platform-specific APIs
+// in a later milestone; never scrape private or protected media here.
+const URL_IMPORT_MAX_MB = Math.max(1, Math.min(100, Number(process.env.URL_IMPORT_MAX_MB) || 40));
+const URL_IMPORT_MAX_BYTES = URL_IMPORT_MAX_MB * 1024 * 1024;
+const URL_IMPORT_MAX_CONCURRENT = Math.max(1, Math.min(4, Number(process.env.URL_IMPORT_MAX_CONCURRENT) || 2));
+let activeUrlConversions = 0;
+
+app.post("/links/inspect", (req, res) => {
+  try {
+    const info = getDirectLinkInfo(req.body?.url);
+    return res.status(200).json({ ...info, reachableUnchecked: true, maxFileSizeMB: URL_IMPORT_MAX_MB });
+  } catch (error) {
+    if (error instanceof PublicMediaError) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    return res.status(400).json({ error: "Invalid media link.", code: "INVALID_URL" });
+  }
+});
+
+app.post("/convert/url", async (req, res) => {
+  const target = normalizeTarget(req.body?.target || req.body?.format);
+  if (!isSupportedTarget(target)) {
+    return res.status(400).json({ error: "Unsupported target format.", code: "INVALID_TARGET" });
+  }
+  const rawOptions = parseConversionOptions(req.body, target);
+  const options = sanitizeOptionsForTarget(rawOptions, target);
+  const entitlement = resolveEntitlement(req);
+  const optionError = validateOptions(options, target, entitlement);
+  if (optionError) return res.status(400).json({ error: optionError, code: "INVALID_OPTIONS" });
+
+  let info;
+  try {
+    info = getDirectLinkInfo(req.body?.url);
+    if (!info.supported) {
+      return res.status(422).json({ error: info.message, code: "PLATFORM_NOT_SUPPORTED" });
+    }
+  } catch (error) {
+    if (error instanceof PublicMediaError) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    return res.status(400).json({ error: "Invalid URL.", code: "INVALID_URL" });
+  }
+
+  if (activeUrlConversions >= URL_IMPORT_MAX_CONCURRENT) {
+    return res.status(503).json({ error: "Link conversion is currently busy. Please try again shortly.", code: "BUSY" });
+  }
+  activeUrlConversions += 1;
+  const tempDir = makeTempDir("converto-link-");
+  const inputPath = path.join(tempDir, "source");
+  const outputPath = path.join(tempDir, `converted.${target}`);
+  let released = false;
+  function finish() {
+    if (released) return;
+    released = true;
+    activeUrlConversions -= 1;
+    cleanupDirectories(tempDir);
+  }
+
+  try {
+    const download = await downloadPublicMedia(info.url, inputPath, {
+      maxBytes: URL_IMPORT_MAX_BYTES,
+      timeoutMs: 20000,
+      maxRedirects: 3,
+    });
+    const inputExt = detectInputExt(download.name);
+    if (inputExt === target) {
+      throw new PublicMediaError("SAME_FORMAT", "Source and target formats are the same.", 400);
+    }
+    await runFfmpegConversion(inputPath, target, outputPath, options);
+    if (!fs.existsSync(outputPath) || fs.statSync(outputPath).size === 0) {
+      throw new Error("Encoder produced no output.");
+    }
+    const downloadName = buildOutputName(download.name, target);
+    res.setHeader("Content-Type", MIME_MAP[target] || "application/octet-stream");
+    // res.download adds Content-Disposition and streams without loading the file to memory.
+    res.download(outputPath, downloadName, (err) => {
+      if (err) console.warn("Link conversion download interrupted:", err.message);
+      finish();
+    });
+    res.on("close", finish);
+  } catch (error) {
+    finish();
+    if (error instanceof PublicMediaError) {
+      return res.status(error.status).json({ error: error.message, code: error.code });
+    }
+    console.error("Link conversion failed:", error.message);
+    return res.status(500).json({ error: getPublicConversionError(error, target), code: "CONVERSION_FAILED" });
+  }
+});
+
 app.post("/convert", upload.single("file"), async (req, res) => {
   const startedAt = Date.now();
   const file = req.file;
@@ -2256,6 +2281,7 @@ app.post("/convert", upload.single("file"), async (req, res) => {
     videoResolution: options.videoResolution,
     videoCodec: options.videoCodec,
     videoQuality: options.videoQuality,
+    qualityPreset: options.qualityPreset,
     videoFps: options.videoFps,
     muteAudio: options.muteAudio,
     imageWidth: options.imageWidth,
@@ -2502,8 +2528,12 @@ app.use((err, req, res, next) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`Converto server running on port ${PORT}`);
-  console.log(`FFmpeg path: ${ffmpegInstaller.path}`);
-  console.log(`AVIF engine: ${sharp ? "Sharp/libvips" : "unavailable"}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    console.log(`Converto server running on port ${PORT}`);
+    console.log(`FFmpeg path: ${ffmpegInstaller.path}`);
+    console.log(`AVIF engine: ${sharp ? "Sharp/libvips" : "unavailable"}`);
+  });
+}
+
+module.exports = { app, buildFfmpegArgs, parseConversionOptions, sanitizeOptionsForTarget, validateOptions };

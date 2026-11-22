@@ -7,7 +7,9 @@
   "scripts": {
     "start": "node index.js",
     "verify:sharp": "node verify-sharp.js",
-    "postinstall": "node verify-sharp.js"
+    "postinstall": "node verify-sharp.js",
+    "test": "node --test test/*.test.js",
+    "test:media": "node test/integration-ffmpeg.js"
   },
   "engines": {
     "node": ">=20 <23"
