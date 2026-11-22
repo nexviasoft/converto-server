@@ -24,9 +24,10 @@ RUN npm ci --include=optional --omit=dev
 
 COPY --chown=node:node . .
 
+RUN mkdir -p /app/uploads && chown node:node /app/uploads
+
 USER node
 
 EXPOSE 10000
 
 CMD ["node", "index.js"]
-
