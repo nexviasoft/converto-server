@@ -2145,6 +2145,7 @@ const { inspectPlatformMedia } = require("./media-inspector");
 
 let activeMediaProbes = 0;
 
+app.use("/auth", require("./firebase-auth-route"));
 app.use("/media", require("./media-download-route"));
 
 app.post("/media/inspect", async (req, res) => {
