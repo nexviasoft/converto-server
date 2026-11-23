@@ -2145,6 +2145,8 @@ const { inspectPlatformMedia } = require("./media-inspector");
 
 let activeMediaProbes = 0;
 
+app.use("/media", require("./media-download-route"));
+
 app.post("/media/inspect", async (req, res) => {
   if (process.env.CONVERTO_MEDIA_INSPECT_ENABLED !== "true") {
     return res.status(403).json({

@@ -1,4 +1,4 @@
-﻿"use strict";
+"use strict";
 
 const { execFile } = require("node:child_process");
 const { promisify } = require("node:util");
@@ -42,7 +42,10 @@ function sanitizeMetadata(raw, provider) {
   };
 }
 
-async function inspectPlatformMedia(url) {
+async function inspectPlatformMedia(url, options = {}) {
+  if (options.signal?.aborted) {
+    throw mediaError(499, "CANCELLED", "Inspection cancelled.");
+  }
   if (typeof url !== "string" || url.length > 2048) {
     throw mediaError(400, "INVALID_URL", "Invalid media URL.");
   }
@@ -91,12 +94,16 @@ async function inspectPlatformMedia(url) {
       {
         timeout: 30000,
         maxBuffer: 2 * 1024 * 1024,
-        windowsHide: true
+        windowsHide: true,
+        signal: options.signal
       }
     );
 
     stdout = result.stdout;
-  } catch {
+  } catch (error) {
+    if (options.signal?.aborted || error?.name === "AbortError") {
+      throw mediaError(499, "CANCELLED", "Inspection cancelled.");
+    }
     throw mediaError(
       502,
       "EXTRACTION_FAILED",
